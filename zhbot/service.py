@@ -466,9 +466,10 @@ class Service:
         return row
 
     @transactional
-    def callback_answered(self, query, delivered):
+    def callback_answered(self, query, delivered, *, unavailable=False):
+        """Only the notification ACK state changes; never replay its action."""
         self.db.execute("UPDATE processed_callbacks SET answer_status=? WHERE id=? AND answer_status='sending'",
-                        ('done' if delivered else 'unknown', query))
+                        ('unavailable' if unavailable else 'done' if delivered else 'unknown', query))
 
     @transactional
     def recover(self):

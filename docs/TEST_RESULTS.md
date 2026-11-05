@@ -6,9 +6,10 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `python3 -m unittest discover -q` | 172 项测试通过，无失败/错误；Python 3.12.14 |
+| `python3 -m unittest discover -q` | 182 项测试通过，无失败/错误；Python 3.12.14 |
 | `python3 -m unittest tests.test_okpay tests.test_okpay_flows tests.test_payment_quarantine tests.test_payment_safety tests.test_payments -q` | 72 项协议与支付测试通过 |
 | `python3 -m unittest tests.test_okpay tests.test_okpay_flows -q` | 28 项新协议与流程测试通过 |
+| `python3 -m unittest tests.test_transport_safety -q` | 10 项代理句柄与回调确认分类/幂等回归通过 |
 | `python3 -m unittest tests.test_payment_review_ui -q` | 6 项充值隔离详情回归通过 |
 | `python3 -m unittest tests.test_adjustments tests.test_ui tests.test_ui_transport tests.test_ui_migration -q` | 32 项菜单、积分调整、传输与迁移测试通过 |
 | `python3 -m unittest tests.test_outbox_auth tests.test_app tests.test_delivery -q` | 35 项相关测试通过 |
@@ -16,7 +17,7 @@
 | `python3 -m compileall -q zhbot tests` | 通过 |
 | `git diff --check` | 通过 |
 
-172 是当前 unittest 测试方法数（本轮前基线为 166，新增 6）；其中多个方法还覆盖多组异常输入或所有 5 个回执位置的崩溃子场景，不把子场景另计为测试数量。
+182 是当前 unittest 测试方法数（本轮前基线为 172，新增 10）；其中多个方法还覆盖多组异常输入或所有 5 个回执位置的崩溃子场景，不把子场景另计为测试数量。
 
 ## 覆盖与阶段证据
 
@@ -129,6 +130,18 @@ schema 5 增加 reply_markup、UI 状态/动作、回调去重和人工调整记
 已入账或其他不可关闭状态不显示关闭按钮，执行中的任务暂不显示；进入填写依据步骤时再次核对状态与任务，最终仍由 close_no_credit 校验。没有修改支付状态机、账本、已有认领或隔离；已入账不自动倒转、不重复加分、不自动退款。真实入口仍 DisabledGateway。
 
 实际执行：`python3 -m unittest tests.test_payment_review_ui -q` 6 项、`python3 -m unittest discover -q` 172 项通过；demo 仍为 completed/可用2/冻结0/3条账变/5项回执，compileall 和 git diff --check 通过。独立代码审阅复核完整172项并检查白名单/分页/关闭门槛，无实质性发现；最后移除自由文本原因回显后，再由实现者重跑全套172项。无真实支付、部署或合并。
+
+### 代理句柄启动与不可确认回调（2026-11-05）
+
+上游隔离测试报告：HTTP secret 占位值通过代理到官方 getMe 的替换成功，但应用本地真实 token 形状正则先拒绝启动；另一窗口旧回调 answerCallbackQuery 出现 HTTP400。当前任务只作离线复现，不沿用这些外部测试作为本提交的实测证明。本执行环境元数据无 Telegram secret 绑定，未读取实际变量/凭据，也未取得其非秘密占位格式；已请求脱敏格式，当前仅采用安全路径段支持策略。
+
+根因一：构造器把真实 token 外形当作唯一可接受格式。现允许 1～512 的 `[A-Za-z0-9_:-]` 字符串；真实 token 与合成不透明句柄均可到固定官方 HTTPS getMe，空值/不安全 URL 字符/过长值在发起前拒绝，原值不转码不替换；getMe/机器人绑定门槛保留。没有代理/TLS/目标更改，也不从安全形状推断 secret 有效或就绪。异常正文/urllib 原因可能带 token URL，仍只产生通用错误；离线覆盖 URLError、HTTPError 原因和 JSON 描述携带合成 token URL，以及 main 的标准错误输出/格式化 traceback，不含这些值或 URL。
+
+根因二：worker 已不会因确认失败重做动作，但原来统一记 unknown，连 fatal 也被吞掉。现仅 answerCallbackQuery 的一致 HTTP400+ok=false+整数 error_code400+精确已知描述“Bad Request: query is too old and response timeout expired or query ID is invalid”被分类为 CallbackUnavailable，answer_callback 返回 False，仅确认提示终态记 unavailable；文本可能指 ID 无效，不能证明具体实测请求真的过期。成功返回 True；其他400、HTTP/JSON冲突、5xx、连接异常、未知描述或非布尔 transport 返回保持 unknown，fatal 错误先落 unknown 再传播停止。业务发送的400分类不被这条 ACK 专用规则改变。无需改 schema，原确认状态列允许该新终态。
+
+新增10项测试，首批9项中7项缺失功能失败、2项保守对照通过；另增加非布尔 transport 结果的5个子场景，先复现被误记 done，再收紧为只有 True 才 done。真实菜单确认人工加2后模拟旧 ACK400，恢复并重复 callback/update，确认只尝试一次、积分仍12、账本/调整记录各1；没有重放业务。
+
+本轮实际执行：专项10项、完整182项通过；demo仍为 completed/可用2/冻结0/3条账变/5项回执，compileall、git diff --check通过。独立审阅在 socket连接阻断下跑26项传输/runtime相关测试通过，未发现阻塞的正确性、幂等或密钥日志问题。未发起真实 Telegram 或支付请求，未部署、未合并；实际代理句柄与供应商错误描述兼容性仍须获得脱敏格式并在另行批准的隔离测试核对，不能从本离线夹具宣称线上通过。
 
 ## 尚未验证或交付的能力
 

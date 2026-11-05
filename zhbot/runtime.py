@@ -50,11 +50,15 @@ class OutboxWorker:
             return False
         self._last_was_answer = True
         try:
-            self.transport.answer_callback(answer['id'], answer['answer'])
+            accepted = self.transport.answer_callback(answer['id'], answer['answer'])
+        except TelegramError as error:
+            self.s.callback_answered(answer['id'], False)
+            if error.fatal:
+                raise
         except Exception:
             self.s.callback_answered(answer['id'], False)
         else:
-            self.s.callback_answered(answer['id'], True)
+            self.s.callback_answered(answer['id'], accepted is True, unavailable=accepted is False)
         return True
 
     def work_once(self):

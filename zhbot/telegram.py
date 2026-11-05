@@ -15,6 +15,14 @@ class TelegramError(Exception):
         self.fatal = fatal
 
 
+class CallbackUnavailable(TelegramError):
+    """A consistent, recognized rejection of an obsolete/unanswerable ACK.
+
+    This says nothing about whether the already-persisted action succeeded,
+    or whether the callback was expired versus its query ID being invalid.
+    """
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -24,7 +32,10 @@ class Telegram:
     MAX_RESPONSE = 8 * 1024 * 1024
 
     def __init__(self, token, opener=None):
-        if type(token) is not str or not re.fullmatch(r'[0-9]{5,20}:[A-Za-z0-9_-]{20,100}', token):
+        # An HTTP-secret proxy may provide an opaque handle rather than the
+        # real Telegram token's shape. Validate a bounded safe path segment,
+        # preserve it byte-for-byte, and let getMe establish actual identity.
+        if type(token) is not str or not re.fullmatch(r'[A-Za-z0-9_:-]{1,512}', token):
             raise RuleError('TELEGRAM_BOT_TOKEN 格式无效。')
         self._base = 'https://api.telegram.org/bot' + token + '/'
         # Keep proxy settings and default TLS certificate verification; forbid redirects.
@@ -55,6 +66,9 @@ class Telegram:
                 code = body.get('error_code')
                 if http_error is not None and (type(code) is not int or code != http_error):
                     raise TelegramError('Telegram HTTP 状态与错误码冲突，结果未知。')
+                if (method == 'answerCallbackQuery' and http_error == 400 and type(code) is int and code == 400
+                        and body.get('description') == 'Bad Request: query is too old and response timeout expired or query ID is invalid'):
+                    raise CallbackUnavailable('回调提示已不可确认；不代表业务未执行。', definite=True)
                 definite = type(code) is int and code in {400, 403, 429}
                 retry = None
                 if code == 429:
@@ -89,10 +103,16 @@ class Telegram:
         return result['message_id']
 
     def answer_callback(self, query, text):
+        """Return ACK availability only; False never means the action failed."""
         if type(query) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', query):
             raise RuleError('回调编号无效。')
-        if self.call('answerCallbackQuery', {'callback_query_id': query, 'text': text}) is not True:
+        try:
+            result = self.call('answerCallbackQuery', {'callback_query_id': query, 'text': text})
+        except CallbackUnavailable:
+            return False  # Terminal ACK outcome only, never action success/failure.
+        if result is not True:
             raise TelegramError('回调确认结果未知。')
+        return True
 
     def get_updates(self, offset):
         result = self.call('getUpdates', {'offset': offset, 'timeout': 25, 'limit': 50,
