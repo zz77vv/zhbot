@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS messages (
  id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES batches(id), seq INTEGER NOT NULL,
  kind TEXT NOT NULL, content TEXT NOT NULL, caption TEXT NOT NULL DEFAULT '',
  status TEXT NOT NULL DEFAULT 'pending', telegram_id INTEGER, reason TEXT NOT NULL DEFAULT '',
+ not_before INTEGER NOT NULL DEFAULT 0,
  UNIQUE(batch_id,seq)
 );
 CREATE TABLE IF NOT EXISTS ledger (
@@ -74,6 +75,12 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE TABLE IF NOT EXISTS payment_transactions (
  transaction_id TEXT PRIMARY KEY, payment_id TEXT NOT NULL UNIQUE REFERENCES payments(id)
 );
+CREATE TABLE IF NOT EXISTS payment_jobs (
+ id INTEGER PRIMARY KEY, payment_id TEXT NOT NULL REFERENCES payments(id),
+ kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_payment_job ON payment_jobs(payment_id)
+ WHERE status IN ('pending','sending');
 """
 
 

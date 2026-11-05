@@ -280,9 +280,9 @@ class Service:
     def claim_message(self):
         row = self.db.one("""SELECT m.*, b.chat_id,b.kind AS batch_kind,b.ref,b.revision
             FROM messages m JOIN batches b ON b.id=m.batch_id
-            WHERE b.status='queued' AND m.status='pending'
+            WHERE b.status='queued' AND m.status='pending' AND m.not_before<=?
             AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.batch_id=m.batch_id AND p.seq<m.seq AND p.status!='sent')
-            ORDER BY m.id LIMIT 1""")
+            ORDER BY m.id LIMIT 1""", (self.clock(),))
         if row:
             self.db.execute("UPDATE messages SET status='sending' WHERE id=?", (row['id'],))
         return row
@@ -320,6 +320,13 @@ class Service:
     @transactional
     def uncertain(self, message, reason):
         self._send_problem(message, 'unknown', reason)
+
+    @transactional
+    def defer(self, message, seconds):
+        seconds = parse_uint(seconds, maximum=3600)
+        if not self.db.execute("UPDATE messages SET status='pending',not_before=? WHERE id=? AND status='sending'",
+                               (self.clock() + seconds, parse_uint(message))).rowcount:
+            raise RuleError('发送记录状态已变更。')
 
     @transactional
     def rejected(self, message, reason):
@@ -376,3 +383,5 @@ class Service:
         for msg in self.db.all("SELECT id FROM messages WHERE status='sending'"):
             self._send_problem(msg['id'], 'unknown', '进程中断，发送结果未知')
         self.db.execute("UPDATE payments SET status='unknown',reason='进程中断，创建结果未知' WHERE status='creating'")
+        self.db.execute("UPDATE payments SET status='unknown',reason='进程中断，查单结果未知' WHERE id IN (SELECT payment_id FROM payment_jobs WHERE status='sending') AND status!='paid'")
+        self.db.execute("UPDATE payment_jobs SET status='unknown' WHERE status='sending'")

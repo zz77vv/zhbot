@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bot state and credentials must never enter source control.
+var/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.lock
+.env
+.env.*
+!.env.example
+*.pem
