@@ -134,9 +134,13 @@ class Application:
                 draft = self.s.new_draft(actor, self._args(body, 1)[0])
                 self.s.note(actor, f'草稿 {draft} 已建立，请发送材料；/draft 预览后确认才冻结积分。')
             elif command == '/draft':
-                draft = self.s.draft(actor)
-                self.s.select(actor, 'customer', draft['id'])
-                self.s.preview_customer(actor, draft['id'])
+                draft = self.s.resume_customer(actor)
+                if draft is None:
+                    self.s.note(actor, '已退出回执编辑；暂无客户草稿，请使用 /new 项目ID 创建。')
+                elif not draft['items']:
+                    self.s.note(actor, f'已切换到客户草稿 {draft["id"]}，请先添加材料，再使用 /draft 完整预览。')
+                else:
+                    self.s.preview_customer(actor, draft['id'])
             elif command == '/confirm':
                 args = self._args(body, 2)
                 order = self.s.confirm(actor, args[0], args[1])

@@ -101,6 +101,17 @@ class Service:
         return row
 
     @transactional
+    def resume_customer(self, actor):
+        """Explicitly leave receipt editing even when no customer preview exists."""
+        self.user(actor)
+        row = self.db.one("SELECT id FROM drafts WHERE user_id=? AND state='editing'", (actor,))
+        if row is None:
+            self.db.execute('DELETE FROM selections WHERE actor=?', (actor,))
+            return None
+        self.select(actor, 'customer', row['id'])
+        return self.draft(actor, row['id'])
+
+    @transactional
     def add_customer_item(self, actor, kind, content, caption=''):
         row = self.draft(actor)
         if len(row['items']) >= MAX_ITEMS:

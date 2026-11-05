@@ -3,6 +3,7 @@ import unittest
 
 from tests import test_orders
 from zhbot.app import Application
+from zhbot.core import RuleError
 from zhbot.service import Service
 from zhbot.store import Store
 
@@ -144,6 +145,91 @@ class AppTests(unittest.TestCase):
         self.assertIn('failed', messages[-1]['content'])
         self.assertNotIn('积分已冻结', messages[-1]['content'])
         self.assertEqual(self.s.balance(101), (10, 0))
+
+    def receipt_with_personal_draft(self, *, personal=True):
+        app = self.app()
+        customer = self.s.new_draft(101, self.project)
+        self.s.add_customer_item(101, 'text', '客户模拟材料')
+        self.s.preview_customer(101, customer)
+        self.drain()
+        order = self.s.confirm(101, customer, 1)
+        own = self.s.new_draft(9001, self.project) if personal else None
+        self.s.open_receipt(9001, order)
+        self.s.add_receipt_item(9001, 'text', '客户模拟回执')
+        self.s.preview_receipt(9001, order)
+        self.drain()
+        return app, order, own
+
+    def test_empty_personal_draft_switch_routes_materials_without_touching_receipt(self):
+        app, order, own = self.receipt_with_personal_draft()
+        receipt_before = self.s.receipt(9001, order)
+        ledger_before = self.db.all('SELECT * FROM ledger ORDER BY id')
+        app.process_update(update(10, '/draft', 9001))
+        self.assertEqual(self.db.one('SELECT kind,ref FROM selections WHERE actor=9001'),
+                         {'kind': 'customer', 'ref': own})
+        reply = self.drain()[-1]['content']
+        self.assertIn('客户草稿', reply)
+        self.assertIn('添加材料', reply)
+        self.assertIsNone(self.s.draft(9001, own)['preview_revision'])
+        with self.assertRaises(RuleError):
+            self.s.confirm(9001, own, 1)
+        # Routing must survive a restart, not just an in-memory correction.
+        other = Store(self.path)
+        try:
+            restored = Application(Service(other, {9001}))
+            text = update(11, '个人模拟文字', 9001)
+            restored.process_update(text)
+            restored.process_update(text)
+            restored.process_update(update(12, actor=9001, photo=[{'file_id': 'personal-photo'}]))
+            restored.process_update(update(13, actor=9001, document={'file_id': 'personal-file'}))
+        finally:
+            other.close()
+        self.assertEqual([item['content'] for item in self.s.draft(9001, own)['items']],
+                         ['个人模拟文字', 'personal-photo', 'personal-file'])
+        self.assertEqual(self.s.receipt(9001, order), receipt_before)
+        self.assertEqual(self.s.balance(101), (4, 6))
+        self.assertEqual(self.s.balance(9001), (0, 0))
+        self.assertEqual(self.db.all('SELECT * FROM ledger ORDER BY id'), ledger_before)
+        self.assertEqual(self.s.order(101, order)['status'], 'submitted')
+        self.assertFalse(self.db.one("SELECT id FROM batches WHERE kind='delivery'"))
+
+    def test_missing_personal_draft_switch_exits_receipt_editing_safely(self):
+        app, order, _ = self.receipt_with_personal_draft(personal=False)
+        receipt_before = self.s.receipt(9001, order)
+        app.process_update(update(10, '/draft', 9001))
+        self.assertIsNone(self.db.one('SELECT * FROM selections WHERE actor=9001'))
+        app.process_update(update(11, '个人内容不得写进客户回执', 9001))
+        self.assertEqual(self.s.receipt(9001, order), receipt_before)
+        self.assertEqual(self.db.one('SELECT status FROM processed_updates WHERE id=11')['status'], 'rejected')
+        self.assertEqual(self.s.balance(101), (4, 6))
+
+    def test_nonempty_personal_draft_switch_does_not_bypass_preview_ack(self):
+        app, order, own = self.receipt_with_personal_draft()
+        self.s.add_customer_item(9001, 'text', '已有个人材料')
+        receipt_before = self.s.receipt(9001, order)
+        app.process_update(update(10, '/draft', 9001))
+        self.assertEqual(self.db.one('SELECT kind,ref FROM selections WHERE actor=9001'),
+                         {'kind': 'customer', 'ref': own})
+        self.assertIsNone(self.s.draft(9001, own)['preview_revision'])
+        with self.assertRaises(RuleError):
+            self.s.confirm(9001, own, 1)
+        self.drain()
+        self.assertEqual(self.s.draft(9001, own)['preview_revision'], 1)
+        self.assertEqual(self.s.receipt(9001, order), receipt_before)
+
+    def test_customer_switch_rolls_back_with_unacknowledged_update_on_storage_failure(self):
+        app, order, own = self.receipt_with_personal_draft()
+        before = self.db.one('SELECT kind,ref FROM selections WHERE actor=9001')
+        self.db.execute("CREATE TRIGGER cursor_failure BEFORE INSERT ON processed_updates BEGIN SELECT RAISE(ABORT, 'injected'); END")
+        with self.assertRaises(sqlite3.Error):
+            app.process_update(update(10, '/draft', 9001))
+        self.assertEqual(self.db.one('SELECT kind,ref FROM selections WHERE actor=9001'), before)
+        self.assertEqual(app.offset(), 0)
+        self.db.execute('DROP TRIGGER cursor_failure')
+        app.process_update(update(10, '/draft', 9001))
+        self.assertEqual(self.db.one('SELECT kind,ref FROM selections WHERE actor=9001'),
+                         {'kind': 'customer', 'ref': own})
+        self.assertEqual(app.offset(), 11)
 
 
 if __name__ == '__main__':
