@@ -1,0 +1,26 @@
+# 示例文件；本次未安装、启用或执行。请先核实 Python 路径和实际目录。
+[Unit]
+Description=zhbot Telegram manual order bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zhbot
+Group=zhbot
+WorkingDirectory=/opt/zhbot
+EnvironmentFile=/etc/zhbot/zhbot.env
+ExecStart=/usr/bin/python3.12 -m zhbot run --db /var/lib/zhbot/bot.sqlite3
+StateDirectory=zhbot
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zhbot /tmp
+
+[Install]
+WantedBy=multi-user.target

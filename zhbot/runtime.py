@@ -42,11 +42,29 @@ class OutboxWorker:
     def __init__(self, service, transport):
         self.s = service
         self.transport = transport
+        self._last_was_answer = False
+
+    def _answer_once(self):
+        answer = self.s.claim_callback_answer()
+        if answer is None:
+            return False
+        self._last_was_answer = True
+        try:
+            self.transport.answer_callback(answer['id'], answer['answer'])
+        except Exception:
+            self.s.callback_answered(answer['id'], False)
+        else:
+            self.s.callback_answered(answer['id'], True)
+        return True
 
     def work_once(self):
+        # At most one acknowledgment before giving business messages a turn.
+        if not self._last_was_answer and self._answer_once():
+            return True
         message = self.s.claim_message()
         if message is None:
-            return False
+            return self._answer_once()
+        self._last_was_answer = False
         try:
             telegram_id = self.transport.send(message)
         except TelegramError as error:

@@ -31,7 +31,7 @@ class Telegram:
         self._open = opener or build_opener(NoRedirect()).open
 
     def call(self, method, params, timeout=40):
-        if method not in {'sendMessage', 'sendPhoto', 'sendDocument', 'getUpdates', 'getMe', 'getWebhookInfo'}:
+        if method not in {'sendMessage', 'sendPhoto', 'sendDocument', 'getUpdates', 'getMe', 'getWebhookInfo', 'answerCallbackQuery'}:
             raise RuleError('不支持的 Telegram 操作。')
         request = Request(self._base + method, data=json.dumps(params, ensure_ascii=True).encode(),
                           headers={'Content-Type': 'application/json'}, method='POST')
@@ -78,14 +78,25 @@ class Telegram:
         params[field] = content
         if kind != 'text' and caption:
             params['caption'] = caption
+        markup = message.get('reply_markup')
+        if markup is not None:
+            if type(markup) is not dict or type(markup.get('inline_keyboard')) is not list:
+                raise RuleError('按钮格式无效。')
+            params['reply_markup'] = markup
         result = self.call(method, params)
         if type(result) is not dict or type(result.get('message_id')) is not int or result['message_id'] <= 0:
             raise TelegramError('Telegram 没有返回有效发送编号，结果未知。')
         return result['message_id']
 
+    def answer_callback(self, query, text):
+        if type(query) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', query):
+            raise RuleError('回调编号无效。')
+        if self.call('answerCallbackQuery', {'callback_query_id': query, 'text': text}) is not True:
+            raise TelegramError('回调确认结果未知。')
+
     def get_updates(self, offset):
         result = self.call('getUpdates', {'offset': offset, 'timeout': 25, 'limit': 50,
-                                          'allowed_updates': ['message']})
+                                          'allowed_updates': ['message', 'callback_query']})
         if (type(result) is not list or any(type(x) is not dict or type(x.get('update_id')) is not int
                                            or x['update_id'] < 0 for x in result)):
             raise TelegramError('Telegram 更新列表无效。')

@@ -1,12 +1,14 @@
 """Private-chat command router with atomic inbound deduplication and cursor."""
 import sqlite3
+import re
 
 from .core import MAX_ID, RuleError, bounded_text, parse_uint
 from .payments import Payments
+from .ui import GuidedUI
 
 
 HELP = '''综合报单机器人 V1.0（新实现）
-/start 注册 · /balance 积分 · /projects 可用项目
+/start 注册菜单 · /menu 中文菜单 · /balance 积分 · /projects 可用项目
 /new 项目ID 开始草稿；随后发送文字、图片、文件
 /text 内容 可提交以 / 开头的文字
 /draft 完整预览 · /confirm 草稿ID 版本 确认冻结
@@ -14,22 +16,8 @@ HELP = '''综合报单机器人 V1.0（新实现）
 /orders [页码] · /order 订单ID
 /recharge 整数金额 · /payments · /check 充值单号
 真实充值尚未开放；只支持人工报单。
-管理员：/admin 查看管理命令。'''
+管理员：/admin 打开管理菜单，可带原因人工加减分。'''
 
-ADMIN_HELP = '''仅限管理员私聊：
-/project new|项目ID 价格 on|off 项目名称
-/adminprojects 查看所有项目
-/orders [页码] · /order 订单ID 查看完整报单
-/receipt 订单ID 选择回执，随后发送文字、图片、文件
-/undo 撤销末项 · /clear 清空当前编辑内容
-/preview 订单ID 完整预览回执
-/deliver 订单ID 版本 确认交付
-/fail 订单ID 原因 终止尚未交付订单
-/review [页码] 查看交付与充值待核实项
-/resolve 消息记录ID sent|failed 核实依据
-/payment_close 充值单号 核实依据 本地关闭异常单（不入账/退款，不代表上游取消）
-sent 表示已人工确认该项送达；failed 表示已核实整单交付失败、不扣费。
-结果不明不能直接终止或重发。'''
 
 
 class Application:
@@ -37,6 +25,7 @@ class Application:
         self.s = service
         self.db = service.db
         self.payments = payments if payments is not None else Payments(service)
+        self.ui = GuidedUI(self)
 
     def offset(self):
         row = self.db.one("SELECT value FROM settings WHERE key='next_offset'")
@@ -50,16 +39,31 @@ class Application:
             if self.db.one('SELECT id FROM processed_updates WHERE id=?', (number,)) or number < self.offset():
                 return False
             actor, message = self._private_message(update)
+            query = None
+            if actor is None:
+                actor, query = self._private_callback(update)
             status = 'ignored'
+            answer_text = '按钮未执行，请发送 /menu。'
             if actor is not None:
                 try:
                     with self.db.atomic():
-                        self.dispatch(actor, message)
+                        if query is not None:
+                            if not self.db.one('SELECT id FROM processed_callbacks WHERE id=?', (query['id'],)):
+                                self.ui.callback(actor, query)
+                        else:
+                            self.dispatch(actor, message)
                     status = 'done'
                 except sqlite3.Error:
                     raise  # A broken disk/transaction must never acknowledge the update.
                 except RuleError as error:
-                    self.s.note(actor, str(error))
+                    session = self.db.one('SELECT * FROM ui_sessions WHERE actor=?', (actor,))
+                    if session and session['admin_only'] and actor not in self.s.admins:
+                        self.ui.reset(actor)
+                        self.db.execute('DELETE FROM selections WHERE actor=?', (actor,))
+                    if query is None:
+                        self.s.note(actor, str(error))
+                    else:
+                        answer_text = str(error)[:80]
                     status = 'rejected'
                 except Exception:
                     # A programming error cannot poison the polling queue indefinitely.
@@ -69,6 +73,9 @@ class Application:
                     self.s.note(actor, '此条消息处理异常，业务变更已回滚。请联系管理员核实后重试。')
                     for admin in self.s.admins:
                         self.s.note(admin, f'更新 {number} 已隔离，业务变更已回滚。请检查本地审计记录。', admin_only=True)
+            if query is not None:
+                self.db.execute('INSERT OR IGNORE INTO processed_callbacks(id,actor,at,answer) VALUES (?,?,?,?)',
+                                (query['id'], actor, self.s.clock(), '已处理' if status == 'done' else answer_text))
             self.db.execute('INSERT INTO processed_updates(id,status,at) VALUES (?,?,?)', (number, status, self.s.clock()))
             self.db.execute("INSERT INTO settings(key,value) VALUES ('next_offset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(number + 1),))
             return True
@@ -88,11 +95,28 @@ class Application:
             return None, None
         return actor, message
 
+    def _private_callback(self, update):
+        query = update.get('callback_query')
+        if type(query) is not dict or type(query.get('id')) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', query['id']):
+            return None, None
+        source = query.get('message')
+        actor, _ = self._private_message({'message': {'from': query.get('from'),
+            'chat': source.get('chat') if type(source) is dict else None}})
+        if actor is None or type(source) is not dict or 'inline_message_id' in query:
+            return None, None
+        sender = source.get('from')
+        bot = self.db.one("SELECT value FROM settings WHERE key='bot_id'")
+        if (not bot or type(sender) is not dict or sender.get('is_bot') is not True
+                or type(sender.get('id')) is not int or str(sender['id']) != bot['value']
+                or type(source.get('message_id')) is not int or source['message_id'] <= 0):
+            return None, None
+        return actor, query
+
     @staticmethod
     def _args(text, count):
         args = text.split()
         if len(args) != count:
-            raise RuleError('命令参数不正确，使用 /help 或 /admin 查看格式。')
+            raise RuleError('命令参数不正确，请使用 /menu 按钮操作；命令格式见运行文档。')
         return args
 
     def dispatch(self, actor, message):
@@ -103,17 +127,22 @@ class Application:
             bounded_text(text, 4000)
             command, _, body = text.partition(' ')
             body = body.strip()
-            # No @suffix routing or callback actions: only explicit private commands.
+            # Explicit private commands also cancel pending guided input/buttons.
+            self.ui.reset(actor)
             if command == '/start':
                 self.s.register(actor)
-                self.s.note(actor, HELP)
+                self.ui.home(actor)
+                return
+            if command == '/menu':
+                self.ui.home(actor)
                 return
             if command == '/help':
                 self.s.note(actor, HELP)
                 return
             if command == '/admin':
                 self.s.admin(actor)
-                self.s.note(actor, ADMIN_HELP, admin_only=True)
+                self.s.register(actor)
+                self.ui.admin_home(actor)
                 return
             self.s.user(actor)
             if command == '/balance':
@@ -133,7 +162,7 @@ class Application:
                 self.s.note(actor, f'项目 {project} 已保存。', admin_only=True)
             elif command == '/new':
                 draft = self.s.new_draft(actor, self._args(body, 1)[0])
-                self.s.note(actor, f'草稿 {draft} 已建立，请发送材料；/draft 预览后确认才冻结积分。')
+                self.ui.editor(actor)
             elif command == '/draft':
                 draft = self.s.resume_customer(actor)
                 if draft is None:
@@ -141,7 +170,8 @@ class Application:
                 elif not draft['items']:
                     self.s.note(actor, f'已切换到客户草稿 {draft["id"]}，请先添加材料，再使用 /draft 完整预览。')
                 else:
-                    self.s.preview_customer(actor, draft['id'])
+                    batch = self.s.preview_customer(actor, draft['id'])
+                    self.ui.decorate_preview(actor, batch)
             elif command == '/confirm':
                 args = self._args(body, 2)
                 order = self.s.confirm(actor, args[0], args[1])
@@ -168,9 +198,10 @@ class Application:
                 self.s.batch(actor, actor, 'note', [summary] + row['items'], ref=row['id'], admin_only=row['user_id'] != actor)
             elif command == '/receipt':
                 self.s.open_receipt(actor, self._args(body, 1)[0])
-                self.s.note(actor, '已选择回执；发送文字、图片、文件继续编辑。/preview 订单ID 查看当前全部内容。', admin_only=True)
+                self.ui.editor(actor)
             elif command == '/preview':
-                self.s.preview_receipt(actor, self._args(body, 1)[0])
+                batch = self.s.preview_receipt(actor, self._args(body, 1)[0])
+                self.ui.decorate_preview(actor, batch, receipt=True)
             elif command == '/deliver':
                 args = self._args(body, 2)
                 batch = self.s.deliver(actor, args[0], args[1])
@@ -226,6 +257,8 @@ class Application:
             else:
                 raise RuleError('未知命令，请使用 /help。')
             return
+        if self.ui.input(actor, message):
+            return
         if text is not None:
             self._append(actor, 'text', text)
         elif 'photo' in message:
@@ -243,11 +276,13 @@ class Application:
 
     def _append(self, actor, kind, content, caption=''):
         selection = self.db.one('SELECT * FROM selections WHERE actor=?', (actor,))
-        if selection and selection['kind'] == 'receipt':
+        if selection is None:
+            raise RuleError('请先从菜单打开客户草稿或回执，再发送材料。')
+        if selection['kind'] == 'receipt':
             self.s.add_receipt_item(actor, kind, content, caption)
         else:
             self.s.add_customer_item(actor, kind, content, caption)
-        self.s.note(actor, '已保存一项内容；请完整预览后确认。', admin_only=bool(selection and selection['kind'] == 'receipt'))
+        self.ui.editor(actor)
 
     def _lines(self, actor, lines, *, admin_only=False):
         # Split listing output without splitting an attachment or Unicode surrogate pair.

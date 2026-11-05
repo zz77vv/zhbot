@@ -1,8 +1,10 @@
 """Transactional domain operations and persistent, ordered Telegram outbox."""
 from functools import wraps
+import json
+import re
 import time
 
-from .core import MAX_ITEMS, MAX_POINTS, RuleError, bounded_text, item_values, parse_uint
+from .core import MAX_BALANCE, MAX_ITEMS, MAX_POINTS, RuleError, bounded_text, item_values, parse_uint
 
 
 def transactional(fn):
@@ -47,6 +49,33 @@ class Service:
         balance = self.user(user)
         self.db.execute('INSERT INTO ledger(user_id,entry_key,available_delta,frozen_delta,available_after,frozen_after,at) VALUES (?,?,?,?,?,?,?)',
                         (user, key, available, frozen, balance['available'], balance['frozen'], self.clock()))
+
+    @transactional
+    def adjust_points(self, actor, user, delta, reason, request_id, *, expected=None):
+        self.admin(actor)
+        user = parse_uint(user)
+        reason = bounded_text(reason, 500).strip()
+        if type(delta) is not int or not 1 <= abs(delta) <= MAX_POINTS:
+            raise RuleError('调整必须是非零整数，单次最多 1,000,000 积分。')
+        if type(request_id) is not str or not re.fullmatch('[0-9a-f]{32}', request_id):
+            raise RuleError('积分调整操作编号无效。')
+        old = self.db.one('SELECT * FROM point_adjustments WHERE request_id=?', (request_id,))
+        if old:
+            if (old['actor'], old['user_id'], old['delta'], old['reason']) != (actor, user, delta, reason):
+                raise RuleError('积分调整编号已经用于其他操作。')
+            return old
+        row = self.user(user)
+        if expected is not None and tuple(expected) != (row['available'], row['frozen']):
+            raise RuleError('余额已变化，请重新查看并确认积分调整。')
+        if (not 0 <= row['available'] + delta <= MAX_BALANCE
+                or (delta > 0 and row['available'] + row['frozen'] + delta > MAX_BALANCE)):
+            raise RuleError('可用积分不足或超过余额上限；冻结积分不能扣减。')
+        self.ledger(user, 'manual:' + request_id, delta, 0)
+        self.db.execute('INSERT INTO point_adjustments VALUES (?,?,?,?,?,?,?,?)',
+                        (request_id, actor, user, delta, reason, row['available'] + delta, row['frozen'], self.clock()))
+        self.audit(actor, 'points_adjusted', request_id, f'用户 {user}，调整 {delta:+d}；原因：{reason}')
+        self.note(user, f'管理员人工调整积分 {delta:+d}，可用 {row["available"] + delta}，冻结 {row["frozen"]}。原因：{reason}')
+        return self.db.one('SELECT * FROM point_adjustments WHERE request_id=?', (request_id,))
 
     @transactional
     def save_project(self, actor, project, title, price, active):
@@ -314,6 +343,8 @@ class Service:
             ORDER BY m.id LIMIT 1""", (self.clock(),))
         if row:
             self.db.execute("UPDATE messages SET status='sending' WHERE id=?", (row['id'],))
+        if row and row.get('reply_markup'):
+            row['reply_markup'] = json.loads(row['reply_markup'])
         return row
 
     def _admin_audience_allowed(self, batch):
@@ -428,7 +459,20 @@ class Service:
             self._release(target, actor, reason)
 
     @transactional
+    def claim_callback_answer(self):
+        row = self.db.one("SELECT * FROM processed_callbacks WHERE answer_status='pending' ORDER BY at,id LIMIT 1")
+        if row:
+            self.db.execute("UPDATE processed_callbacks SET answer_status='sending' WHERE id=?", (row['id'],))
+        return row
+
+    @transactional
+    def callback_answered(self, query, delivered):
+        self.db.execute("UPDATE processed_callbacks SET answer_status=? WHERE id=? AND answer_status='sending'",
+                        ('done' if delivered else 'unknown', query))
+
+    @transactional
     def recover(self):
+        self.db.execute("UPDATE processed_callbacks SET answer_status='unknown' WHERE answer_status='sending'")
         for msg in self.db.all("SELECT id FROM messages WHERE status='sending'"):
             self._send_problem(msg['id'], 'unknown', '进程中断，发送结果未知')
         self._cancel_unauthorized_outbox()

@@ -56,6 +56,24 @@ CREATE TABLE IF NOT EXISTS messages (
  not_before INTEGER NOT NULL DEFAULT 0,
  UNIQUE(batch_id,seq)
 );
+CREATE TABLE IF NOT EXISTS ui_sessions (
+ actor INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0,
+ flow TEXT NOT NULL DEFAULT '', data TEXT NOT NULL DEFAULT '{}', admin_only INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ui_actions (
+ token TEXT PRIMARY KEY, actor INTEGER NOT NULL, generation INTEGER NOT NULL, command TEXT NOT NULL,
+ data TEXT NOT NULL, admin_only INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+ message_id INTEGER REFERENCES messages(id), used_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS processed_callbacks (
+ id TEXT PRIMARY KEY, actor INTEGER NOT NULL, at INTEGER NOT NULL,
+ answer TEXT NOT NULL, answer_status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE IF NOT EXISTS point_adjustments (
+ request_id TEXT PRIMARY KEY, actor INTEGER NOT NULL, user_id INTEGER NOT NULL REFERENCES users(tg_id),
+ delta INTEGER NOT NULL, reason TEXT NOT NULL, available_after INTEGER NOT NULL,
+ frozen_after INTEGER NOT NULL, at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ledger (
  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(tg_id), entry_key TEXT NOT NULL UNIQUE,
  available_delta INTEGER NOT NULL, frozen_delta INTEGER NOT NULL,
@@ -134,7 +152,7 @@ def quarantine_identities(connection, payment):
 
 class Store:
     APPLICATION_ID = 0x5A484231  # ZHB1; independent of any unavailable snapshot schema.
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(self, path):
         self.connection = sqlite3.connect(path, isolation_level=None, timeout=10)
@@ -157,6 +175,8 @@ class Store:
             for statement in SCHEMA.split(';'):
                 if statement.strip():
                     self.connection.execute(statement)
+            if 'reply_markup' not in {row[1] for row in self.connection.execute('PRAGMA table_info(messages)')}:
+                self.connection.execute('ALTER TABLE messages ADD COLUMN reply_markup TEXT')
             if has_tables and version < 4:
                 self._migrate_identity_sightings()
             self.connection.execute(f'PRAGMA application_id={self.APPLICATION_ID}')
@@ -171,7 +191,7 @@ class Store:
         application_id = self.connection.execute('PRAGMA application_id').fetchone()[0]
         version = self.connection.execute('PRAGMA user_version').fetchone()[0]
         has_tables = self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is not None
-        if ((has_tables and (application_id != self.APPLICATION_ID or version not in {1, 2, 3, self.SCHEMA_VERSION}))
+        if ((has_tables and (application_id != self.APPLICATION_ID or version not in {1, 2, 3, 4, self.SCHEMA_VERSION}))
                 or (not has_tables and (application_id not in {0, self.APPLICATION_ID} or version not in {0, self.SCHEMA_VERSION}))):
             raise RuntimeError('未知或不兼容的数据库；需单独审查迁移，禁止直接复用。')
         return version, has_tables
