@@ -40,6 +40,8 @@ def item_values(kind, content, caption=''):
     if kind not in {'text', 'photo', 'document'}:
         raise RuleError('仅支持文字、图片和文件。')
     bounded_text(content, 3500 if kind == 'text' else 512)
+    if type(caption) is not str:
+        raise RuleError('附件说明格式无效。')
     if caption:
         bounded_text(caption, 1000)
     return kind, content, caption

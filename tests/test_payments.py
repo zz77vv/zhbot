@@ -111,12 +111,14 @@ class PaymentTests(unittest.TestCase):
     def test_cross_order_transaction_reuse_cannot_credit(self):
         payment = self.payment()
         self.now = 1002
-        self.settle(payment, transaction_id='shared-simulation-tx')
+        self.settle(payment)
         self.assertEqual(self.s.balance(101), (13, 0))
         second = self.p.request(102, '3')
         self.p.work_once()
+        transaction = self.p.get(101, payment)['platform_id']
+        self.db.execute('UPDATE payments SET platform_id=? WHERE id=?', (transaction, second))
         row = self.p.get(102, second)
-        self.gateway.results[second] = replace(self.gateway.paid(row, paid_at=1003), transaction_id='shared-simulation-tx')
+        self.gateway.results[second] = self.gateway.paid(row, paid_at=1003)
         self.now = 1004
         self.p.request_check(102, second)
         self.p.work_once()
@@ -143,6 +145,13 @@ class PaymentTests(unittest.TestCase):
         self.s.recover()
         self.assertEqual(self.p.get(101, payment)['status'], 'unknown')
         self.assertFalse(self.db.one("SELECT * FROM payment_jobs WHERE status='pending'"))
+
+    def test_conflicting_platform_and_transaction_identity_never_credit(self):
+        payment = self.payment()
+        self.now = 1002
+        self.settle(payment, transaction_id='invented-second-identity')
+        self.assertEqual(self.s.balance(101), (10, 0))
+        self.assertEqual(self.p.get(101, payment)['status'], 'review')
 
 
 if __name__ == '__main__':

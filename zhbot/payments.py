@@ -180,7 +180,8 @@ class Payments:
                     and type(evidence.paid_at) is int
                     and row['created_at'] <= evidence.paid_at <= now < row['expires_at']
                     and row['status'] == 'pending'
-                    and type(evidence.transaction_id) is str and 0 < len(evidence.transaction_id) <= 128)
+                    and type(evidence.transaction_id) is str
+                    and evidence.transaction_id == evidence.platform_id)
         if not complete:
             self._review(row, '付款人、金额、币种、状态、时间或此前状态需人工核实')
             return

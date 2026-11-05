@@ -135,6 +135,29 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(self.s.balance(101), (4, 6))
         self.assertEqual(len(self.db.all('SELECT * FROM ledger')), 1)
 
+    def test_non_string_caption_is_business_rejection_not_sql_failure(self):
+        self.draft()
+        for caption in [False, [], {}, 0, None]:
+            with self.subTest(caption=caption), self.assertRaises(RuleError):
+                self.s.add_customer_item(101, 'photo', 'fake-photo', caption)
+        self.assertEqual(len(self.s.draft(101)['items']), 1)
+
+    def test_unknown_database_schema_is_refused_without_mutation(self):
+        import sqlite3
+        legacy = str(Path(self.tmp.name) / 'legacy.sqlite3')
+        connection = sqlite3.connect(legacy)
+        connection.execute('CREATE TABLE old_orders(id INTEGER PRIMARY KEY)')
+        connection.commit()
+        connection.close()
+        with self.assertRaises(RuntimeError):
+            other = Store(legacy)
+            other.close()
+        connection = sqlite3.connect(legacy)
+        try:
+            self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [('old_orders',)])
+        finally:
+            connection.close()
+
 
 if __name__ == '__main__':
     unittest.main()

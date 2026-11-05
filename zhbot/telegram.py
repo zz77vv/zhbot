@@ -36,9 +36,11 @@ class Telegram:
         request = Request(self._base + method, data=json.dumps(params, ensure_ascii=True).encode(),
                           headers={'Content-Type': 'application/json'}, method='POST')
         try:
+            http_error = None
             try:
                 response = self._open(request, timeout=timeout)
             except HTTPError as error:
+                http_error = error.code
                 response = error
             with response:
                 raw = response.read(self.MAX_RESPONSE + 1)
@@ -47,6 +49,8 @@ class Telegram:
             body = json.loads(raw)
             if type(body) is not dict or type(body.get('ok')) is not bool:
                 raise TelegramError('Telegram 响应无效，结果未知。')
+            if http_error is not None and body['ok'] is True:
+                raise TelegramError('Telegram HTTP 状态与响应冲突，结果未知。')
             if body['ok'] is False:
                 code = body.get('error_code')
                 definite = type(code) is int and code in {400, 403, 429}

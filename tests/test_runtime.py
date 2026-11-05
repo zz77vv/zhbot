@@ -137,6 +137,14 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             bind_bot(self.s, 23456)
 
+    def test_http_error_cannot_be_overridden_by_success_shaped_body(self):
+        def open_request(request, timeout):
+            raise HTTPError(request.full_url, 500, 'ignored', {}, BytesIO(json.dumps({
+                'ok': True, 'result': {'message_id': 77}}).encode()))
+        with self.assertRaises(TelegramError) as caught:
+            Telegram(TOKEN, opener=open_request).send({'kind': 'text', 'content': '模拟', 'chat_id': 101})
+        self.assertFalse(caught.exception.definite)
+
 
 if __name__ == '__main__':
     unittest.main()

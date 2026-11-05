@@ -161,9 +161,18 @@ class Service:
         return order
 
     def order(self, actor, order):
+        actor = parse_uint(actor)
+        row = self._order_record(order)
+        if actor not in self.admins and row['user_id'] != actor:
+            raise RuleError('订单不存在或无权访问。')
+        return row
+
+    def _order_record(self, order):
+        # Internal outbox recovery relies on authorization at initiation, so a
+        # later admin rotation cannot invalidate already-committed work.
         order = parse_uint(order)
         row = self.db.one('SELECT * FROM orders WHERE id=?', (order,))
-        if row is None or (actor not in self.admins and row['user_id'] != actor):
+        if row is None:
             raise RuleError('订单不存在或无权访问。')
         row['items'] = self.db.all('SELECT * FROM order_items WHERE order_id=? ORDER BY id', (order,))
         return row
@@ -307,7 +316,7 @@ class Service:
             self.db.execute('UPDATE receipts SET preview_revision=?,preview_actor=? WHERE order_id=? AND revision=?',
                             (row['revision'], row['actor'], row['ref'], row['revision']))
         elif row['kind'] == 'delivery':
-            target = self.order(row['actor'], row['ref'])
+            target = self._order_record(row['ref'])
             if target['status'] not in {'delivering', 'delivery_review'}:
                 raise RuleError('交付状态冲突。')
             self.ledger(target['user_id'], f'charge:{target["id"]}', 0, -target['price'])
@@ -342,7 +351,7 @@ class Service:
         self.db.execute("UPDATE batches SET status='review' WHERE id=?", (batch['id'],))
         self.audit(0, 'send_' + status, message, reason)
         if batch['kind'] == 'delivery':
-            target = self.order(batch['actor'], batch['ref'])
+            target = self._order_record(batch['ref'])
             prior_sent = self.db.one("SELECT id FROM messages WHERE batch_id=? AND status='sent'", (batch['id'],))
             if status == 'failed' and not prior_sent:
                 self._cancel_batch(batch['id'])

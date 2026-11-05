@@ -170,6 +170,40 @@ class DeliveryTests(unittest.TestCase):
         self.s.clear_selected(9001)
         self.assertEqual(len(self.s.receipt(9001, order)['items']), 0)
 
+    def test_admin_rotation_does_not_break_committed_delivery_or_recovery(self):
+        order, revision = self.ready()
+        self.s.deliver(9001, order, revision)
+        msg = self.s.claim_message()
+        self.s.admins = frozenset({9002})
+        self.s.recover()
+        self.assertEqual(self.s.order(101, order)['status'], 'delivery_review')
+        self.s.resolve(9002, msg['id'], True, '新管理员核实已发送')
+        while (msg := self.s.claim_message()) is not None:
+            self.s.sent(msg['id'], 5000 + msg['id'])
+        self.assertEqual(self.s.order(101, order)['status'], 'completed')
+        self.assertEqual(self.s.balance(101), (4, 0))
+
+    def test_each_receipt_part_crash_requires_exactly_one_human_resolution(self):
+        for index in range(5):
+            with self.subTest(index=index):
+                # Independent temporary database for every crash position.
+                self.tearDown()
+                self.setUp()
+                order, revision = self.ready()
+                self.s.deliver(9001, order, revision)
+                for _ in range(index):
+                    msg = self.s.claim_message()
+                    self.s.sent(msg['id'], 6000 + msg['id'])
+                inflight = self.s.claim_message()
+                self.s.recover()
+                self.assertEqual(self.s.balance(101), (4, 6))
+                self.s.resolve(9001, inflight['id'], True, '模拟记录核实送达')
+                while (msg := self.s.claim_message()) is not None:
+                    self.assertNotEqual(msg['id'], inflight['id'])
+                    self.s.sent(msg['id'], 7000 + msg['id'])
+                self.assertEqual(self.s.balance(101), (4, 0))
+                self.assertEqual(self.s.order(101, order)['status'], 'completed')
+
 
 if __name__ == '__main__':
     unittest.main()
