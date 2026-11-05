@@ -27,6 +27,7 @@ ADMIN_HELP = '''仅限管理员私聊：
 /fail 订单ID 原因 终止尚未交付订单
 /review [页码] 查看交付与充值待核实项
 /resolve 消息记录ID sent|failed 核实依据
+/payment_close 充值单号 核实依据 本地关闭异常单（不入账/退款，不代表上游取消）
 sent 表示已人工确认该项送达；failed 表示已核实整单交付失败、不扣费。
 结果不明不能直接终止或重发。'''
 
@@ -187,7 +188,7 @@ class Application:
                     JOIN batches b ON b.id=m.batch_id JOIN orders o ON o.id=b.ref
                     WHERE b.kind='delivery' AND o.status='delivery_review' AND m.status IN ('unknown','failed')
                     ORDER BY m.id LIMIT 20 OFFSET ?""", ((page - 1) * 20,))
-                payments = self.db.all("SELECT id,status,reason FROM payments WHERE status IN ('unknown','review') ORDER BY created_at LIMIT 20 OFFSET ?", ((page - 1) * 20,))
+                payments = self.db.all("SELECT id,status,reason FROM payments WHERE status IN ('unknown','review','closed_review') ORDER BY created_at LIMIT 20 OFFSET ?", ((page - 1) * 20,))
                 self._lines(actor, [f'订单 {r["ref"]}，消息记录 {r["id"]}，{r["status"]}：{r["reason"]}' for r in rows]
                             + [f'充值 {r["id"]}，{r["status"]}：{r["reason"]}' for r in payments] or ['暂无待核实项。'], admin_only=True)
             elif command == '/resolve':
@@ -200,6 +201,13 @@ class Application:
             elif command == '/recharge':
                 payment = self.payments.request(actor, self._args(body, 1)[0])
                 self.s.note(actor, f'【离线模拟】充值单 {payment} 已登记。')
+            elif command == '/payment_close':
+                self.s.admin(actor)
+                args = body.split(maxsplit=1)
+                if len(args) != 2:
+                    raise RuleError('格式：/payment_close 充值单号 人工核实依据；仅本地关闭，不入账/退款。')
+                self.payments.close_no_credit(actor, args[0], args[1])
+                self.s.note(actor, '本地充值单已核实关闭，未加分或退款，也未取消上游订单。', admin_only=True)
             elif command == '/payments':
                 rows = self.db.all('SELECT id,status,amount FROM payments WHERE user_id=? ORDER BY created_at DESC LIMIT 20', (actor,))
                 self._lines(actor, [f'{r["id"]} · {r["amount"]} USDT · {r["status"]}' for r in rows] or ['暂无充值单；真实充值未开放。'])

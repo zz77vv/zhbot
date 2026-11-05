@@ -149,7 +149,7 @@ class OutboxAuthorizationTests(unittest.TestCase):
             self.assertEqual(other.one('SELECT status FROM batches WHERE id=?', (admin_batch,))['status'], 'cancelled')
             self.assertEqual(service.order(101, order)['status'], 'completed')
             self.assertEqual(service.balance(101), (4, 0))
-            self.assertEqual(other.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertIn('audience', {row[1] for row in other.execute('PRAGMA table_info(batches)')})
         finally:
             other.close()
 

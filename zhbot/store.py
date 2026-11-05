@@ -82,12 +82,22 @@ CREATE TABLE IF NOT EXISTS payment_jobs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_pending_payment_job ON payment_jobs(payment_id)
  WHERE status IN ('pending','sending');
+CREATE TABLE IF NOT EXISTS payment_identity_claims (
+ kind TEXT NOT NULL CHECK(kind IN ('platform','transaction')), value TEXT NOT NULL,
+ payment_id TEXT NOT NULL REFERENCES payments(id),
+ PRIMARY KEY(kind,value), UNIQUE(payment_id,kind)
+);
+CREATE TABLE IF NOT EXISTS payment_observations (
+ id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES payment_jobs(id),
+ payment_id TEXT NOT NULL REFERENCES payments(id), observed_at INTEGER NOT NULL,
+ evidence TEXT NOT NULL
+);
 """
 
 
 class Store:
     APPLICATION_ID = 0x5A484231  # ZHB1; independent of any unavailable snapshot schema.
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path):
         self.connection = sqlite3.connect(path, isolation_level=None, timeout=10)
@@ -122,7 +132,7 @@ class Store:
         application_id = self.connection.execute('PRAGMA application_id').fetchone()[0]
         version = self.connection.execute('PRAGMA user_version').fetchone()[0]
         has_tables = self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is not None
-        if ((has_tables and (application_id != self.APPLICATION_ID or version not in {1, self.SCHEMA_VERSION}))
+        if ((has_tables and (application_id != self.APPLICATION_ID or version not in {1, 2, self.SCHEMA_VERSION}))
                 or (not has_tables and (application_id not in {0, self.APPLICATION_ID} or version not in {0, self.SCHEMA_VERSION}))):
             raise RuntimeError('未知或不兼容的数据库；需单独审查迁移，禁止直接复用。')
         return version, has_tables

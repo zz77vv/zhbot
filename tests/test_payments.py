@@ -146,12 +146,16 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(self.p.get(101, payment)['status'], 'unknown')
         self.assertFalse(self.db.one("SELECT * FROM payment_jobs WHERE status='pending'"))
 
-    def test_conflicting_platform_and_transaction_identity_never_credit(self):
+    def test_changed_transaction_identity_for_same_bill_requires_review(self):
         payment = self.payment()
         self.now = 1002
-        self.settle(payment, transaction_id='invented-second-identity')
+        self.settle(payment, transaction_id='first-verified-identity', payer=None)
+        self.settle(payment, transaction_id='changed-verified-identity')
         self.assertEqual(self.s.balance(101), (10, 0))
         self.assertEqual(self.p.get(101, payment)['status'], 'review')
+        self.assertIn('冲突', self.p.get(101, payment)['reason'])
+        claim = self.db.one("SELECT value FROM payment_identity_claims WHERE payment_id=? AND kind='transaction'", (payment,))
+        self.assertEqual(claim['value'], 'first-verified-identity')
 
 
 if __name__ == '__main__':

@@ -432,6 +432,9 @@ class Service:
         for msg in self.db.all("SELECT id FROM messages WHERE status='sending'"):
             self._send_problem(msg['id'], 'unknown', '进程中断，发送结果未知')
         self._cancel_unauthorized_outbox()
-        self.db.execute("UPDATE payments SET status='unknown',reason='进程中断，创建结果未知' WHERE status='creating'")
-        self.db.execute("UPDATE payments SET status='unknown',reason='进程中断，查单结果未知' WHERE id IN (SELECT payment_id FROM payment_jobs WHERE status='sending') AND status!='paid'")
+        for row in self.db.all("""SELECT DISTINCT p.id FROM payments p LEFT JOIN payment_jobs j ON j.payment_id=p.id
+            WHERE (p.status='creating' OR j.status='sending') AND p.status NOT IN ('paid','closed','closed_review')"""):
+            reason = '进程中断，支付请求结果未知；不自动重建或入账'
+            self.db.execute("UPDATE payments SET status='unknown',pay_url=NULL,reason=? WHERE id=?", (reason, row['id']))
+            self.audit(0, 'payment_recovered_unknown', row['id'], reason)
         self.db.execute("UPDATE payment_jobs SET status='unknown' WHERE status='sending'")
