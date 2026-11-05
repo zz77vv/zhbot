@@ -130,6 +130,21 @@ class AppTests(unittest.TestCase):
         app.process_update(update(2, '/balance'))
         self.assertEqual(app.offset(), 3)
 
+    def test_confirm_replay_after_failure_reports_current_state_truthfully(self):
+        app = self.app()
+        app.process_update(update(0, f'/new {self.project}'))
+        app.process_update(update(1, '模拟材料'))
+        app.process_update(update(2, '/draft'))
+        self.drain()
+        app.process_update(update(3, '/confirm 1 1'))
+        self.s.fail_order(9001, 1, '模拟失败')
+        self.drain()
+        app.process_update(update(4, '/confirm 1 1'))
+        messages = self.drain()
+        self.assertIn('failed', messages[-1]['content'])
+        self.assertNotIn('积分已冻结', messages[-1]['content'])
+        self.assertEqual(self.s.balance(101), (10, 0))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -145,6 +145,16 @@ class RuntimeTests(unittest.TestCase):
             Telegram(TOKEN, opener=open_request).send({'kind': 'text', 'content': '模拟', 'chat_id': 101})
         self.assertFalse(caught.exception.definite)
 
+    def test_5xx_or_status_conflict_cannot_release_or_automatically_retry(self):
+        for http_code, body_code in [(500, 400), (500, 429), (502, 403), (429, 400), (403, 400)]:
+            def open_request(request, timeout):
+                raise HTTPError(request.full_url, http_code, 'ignored', {}, BytesIO(json.dumps({
+                    'ok': False, 'error_code': body_code, 'parameters': {'retry_after': 1}}).encode()))
+            with self.subTest(http=http_code, body=body_code), self.assertRaises(TelegramError) as caught:
+                Telegram(TOKEN, opener=open_request).send({'kind': 'text', 'content': '模拟', 'chat_id': 101})
+            self.assertFalse(caught.exception.definite)
+            self.assertIsNone(caught.exception.retry_after)
+
 
 if __name__ == '__main__':
     unittest.main()

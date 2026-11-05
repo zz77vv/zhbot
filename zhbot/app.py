@@ -140,7 +140,8 @@ class Application:
             elif command == '/confirm':
                 args = self._args(body, 2)
                 order = self.s.confirm(actor, args[0], args[1])
-                self.s.note(actor, f'订单 {order} 已确认，积分已冻结，等待人工处理。')
+                status = self.s.order(actor, order)['status']
+                self.s.note(actor, f'订单 {order} 当前状态：{status}。重复确认不会重复冻结，余额请使用 /balance 查看。')
             elif command == '/cancel':
                 self.s.cancel_draft(actor)
                 self.s.note(actor, '客户草稿已取消，未冻结积分。')

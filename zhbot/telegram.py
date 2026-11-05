@@ -53,6 +53,8 @@ class Telegram:
                 raise TelegramError('Telegram HTTP 状态与响应冲突，结果未知。')
             if body['ok'] is False:
                 code = body.get('error_code')
+                if http_error is not None and (type(code) is not int or code != http_error):
+                    raise TelegramError('Telegram HTTP 状态与错误码冲突，结果未知。')
                 definite = type(code) is int and code in {400, 403, 429}
                 retry = None
                 if code == 429:
