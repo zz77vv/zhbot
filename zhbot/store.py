@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS receipt_items (
 CREATE TABLE IF NOT EXISTS selections (actor INTEGER PRIMARY KEY, kind TEXT NOT NULL, ref INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS batches (
  id INTEGER PRIMARY KEY, kind TEXT NOT NULL, ref INTEGER, revision INTEGER,
- actor INTEGER NOT NULL, chat_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued'
+ actor INTEGER NOT NULL, chat_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+ audience TEXT NOT NULL DEFAULT 'legacy' CHECK(audience IN ('customer','admin','legacy'))
 );
 CREATE TABLE IF NOT EXISTS messages (
  id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES batches(id), seq INTEGER NOT NULL,
@@ -86,29 +87,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_pending_payment_job ON payment_jobs(paymen
 
 class Store:
     APPLICATION_ID = 0x5A484231  # ZHB1; independent of any unavailable snapshot schema.
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, path):
         self.connection = sqlite3.connect(path, isolation_level=None, timeout=10)
         self.connection.row_factory = sqlite3.Row
-        application_id = self.connection.execute('PRAGMA application_id').fetchone()[0]
-        version = self.connection.execute('PRAGMA user_version').fetchone()[0]
-        has_tables = self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
-        if ((has_tables and (application_id != self.APPLICATION_ID or version != self.SCHEMA_VERSION))
-                or (not has_tables and (application_id not in {0, self.APPLICATION_ID} or version not in {0, self.SCHEMA_VERSION}))):
-            self.connection.close()
-            raise RuntimeError('未知或不兼容的数据库；需单独审查迁移，禁止直接复用。')
         try:
+            self._schema_state()  # Refuse unknown DBs before changing journal mode.
             self.connection.execute('PRAGMA foreign_keys=ON')
             self.connection.execute('PRAGMA journal_mode=WAL')
             self.connection.execute('PRAGMA synchronous=FULL')
-            self.connection.executescript('BEGIN IMMEDIATE;\n' + SCHEMA +
-                                          f'PRAGMA application_id={self.APPLICATION_ID};\n'
-                                          f'PRAGMA user_version={self.SCHEMA_VERSION};\nCOMMIT;')
+            self.connection.execute('BEGIN IMMEDIATE')
+            # Re-read under the lock: another opener may already have migrated it.
+            version, has_tables = self._schema_state()
+            if has_tables and version == 1:
+                self.connection.execute("ALTER TABLE batches ADD COLUMN audience TEXT NOT NULL DEFAULT 'legacy' CHECK(audience IN ('customer','admin','legacy'))")
+                self.connection.execute("UPDATE batches SET audience='customer' WHERE kind IN ('customer_preview','delivery')")
+                self.connection.execute("UPDATE batches SET audience='admin' WHERE kind='receipt_preview'")
+                # V1 'note' has no durable ownership/privilege marker. Leave it
+                # legacy so Service cancels unsent content instead of guessing.
+            # SCHEMA contains simple DDL statements only (no trigger bodies).
+            for statement in SCHEMA.split(';'):
+                if statement.strip():
+                    self.connection.execute(statement)
+            self.connection.execute(f'PRAGMA application_id={self.APPLICATION_ID}')
+            self.connection.execute(f'PRAGMA user_version={self.SCHEMA_VERSION}')
+            self.connection.execute('COMMIT')
         except BaseException:
             self.connection.close()
             raise
         self.depth = 0
+
+    def _schema_state(self):
+        application_id = self.connection.execute('PRAGMA application_id').fetchone()[0]
+        version = self.connection.execute('PRAGMA user_version').fetchone()[0]
+        has_tables = self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is not None
+        if ((has_tables and (application_id != self.APPLICATION_ID or version not in {1, self.SCHEMA_VERSION}))
+                or (not has_tables and (application_id not in {0, self.APPLICATION_ID} or version not in {0, self.SCHEMA_VERSION}))):
+            raise RuntimeError('未知或不兼容的数据库；需单独审查迁移，禁止直接复用。')
+        return version, has_tables
 
     def execute(self, sql, args=()):
         return self.connection.execute(sql, args)

@@ -126,17 +126,25 @@ class Service:
         self.db.execute("UPDATE drafts SET state='cancelled' WHERE id=?", (row['id'],))
         self.db.execute("DELETE FROM selections WHERE actor=? AND kind='customer'", (actor,))
 
-    def batch(self, actor, chat_id, kind, items, ref=None, revision=None):
-        batch = self.db.execute('INSERT INTO batches(kind,ref,revision,actor,chat_id) VALUES (?,?,?,?,?)',
-                                (kind, ref, revision, actor, chat_id)).lastrowid
+    def batch(self, actor, chat_id, kind, items, ref=None, revision=None, *, admin_only=False):
+        if type(admin_only) is not bool:
+            raise RuleError('发送权限标记无效。')
+        admin_only = admin_only or kind == 'receipt_preview'
+        if admin_only:
+            self.admin(actor)
+            if chat_id != actor:
+                raise RuleError('管理员内容只能发送至其私聊。')
+        audience = 'admin' if admin_only else 'customer'
+        batch = self.db.execute('INSERT INTO batches(kind,ref,revision,actor,chat_id,audience) VALUES (?,?,?,?,?,?)',
+                                (kind, ref, revision, actor, chat_id, audience)).lastrowid
         for seq, item in enumerate(items):
             self.db.execute('INSERT INTO messages(batch_id,seq,kind,content,caption) VALUES (?,?,?,?,?)',
                             (batch, seq, item['kind'], item['content'], item.get('caption', '')))
         return batch
 
     @transactional
-    def note(self, actor, text):
-        return self.batch(actor, actor, 'note', [{'kind': 'text', 'content': bounded_text(text)}])
+    def note(self, actor, text, *, admin_only=False):
+        return self.batch(actor, actor, 'note', [{'kind': 'text', 'content': bounded_text(text)}], admin_only=admin_only)
 
     @transactional
     def preview_customer(self, actor, draft=None):
@@ -168,7 +176,7 @@ class Service:
         self.db.execute("UPDATE drafts SET state='confirmed',order_id=? WHERE id=?", (order, row['id']))
         self.db.execute("DELETE FROM selections WHERE actor=? AND kind='customer'", (actor,))
         for admin in self.admins:
-            self.note(admin, f'新订单 {order}，使用 /order {order} 查看。')
+            self.note(admin, f'新订单 {order}，使用 /order {order} 查看。', admin_only=True)
         return order
 
     def order(self, actor, order):
@@ -298,6 +306,7 @@ class Service:
 
     @transactional
     def claim_message(self):
+        self._cancel_unauthorized_outbox()
         row = self.db.one("""SELECT m.*, b.chat_id,b.kind AS batch_kind,b.ref,b.revision
             FROM messages m JOIN batches b ON b.id=m.batch_id
             WHERE b.status='queued' AND m.status='pending' AND m.not_before<=?
@@ -306,6 +315,21 @@ class Service:
         if row:
             self.db.execute("UPDATE messages SET status='sending' WHERE id=?", (row['id'],))
         return row
+
+    def _admin_audience_allowed(self, batch):
+        return batch['audience'] == 'admin' and batch['actor'] in self.admins and batch['chat_id'] == batch['actor']
+
+    def _cancel_unauthorized_outbox(self):
+        for batch in self.db.all("SELECT * FROM batches WHERE status IN ('queued','review') AND audience!='customer'"):
+            if self._admin_audience_allowed(batch):
+                continue
+            reason = '管理员权限已撤销或收件人不匹配' if batch['audience'] == 'admin' else '旧队列无法确认内容权限，停止未发送部分'
+            self.db.execute("UPDATE batches SET status='cancelled' WHERE id=?", (batch['id'],))
+            self.db.execute("UPDATE messages SET status='cancelled',reason=? WHERE batch_id=? AND status='pending'", (reason, batch['id']))
+            self.audit(0, 'outbox_cancelled', batch['id'], reason)
+        for receipt in self.db.all('SELECT order_id,preview_actor FROM receipts WHERE preview_actor IS NOT NULL'):
+            if receipt['preview_actor'] not in self.admins:
+                self.db.execute('UPDATE receipts SET preview_revision=NULL,preview_actor=NULL WHERE order_id=?', (receipt['order_id'],))
 
     @transactional
     def sent(self, message, telegram_id):
@@ -316,9 +340,14 @@ class Service:
         self._finish_batch(row['batch_id'])
 
     def _finish_batch(self, batch):
+        row = self.db.one('SELECT * FROM batches WHERE id=?', (batch,))
+        if row['status'] == 'cancelled':
+            return
+        if row['audience'] != 'customer' and not self._admin_audience_allowed(row):
+            self._cancel_unauthorized_outbox()
+            return
         if self.db.one("SELECT id FROM messages WHERE batch_id=? AND status!='sent'", (batch,)):
             return
-        row = self.db.one('SELECT * FROM batches WHERE id=?', (batch,))
         self.db.execute("UPDATE batches SET status='sent' WHERE id=?", (batch,))
         if row['kind'] == 'customer_preview':
             self.db.execute("UPDATE drafts SET preview_revision=? WHERE id=? AND revision=? AND state='editing'",
@@ -335,7 +364,7 @@ class Service:
             self.audit(row['actor'], 'delivery_completed', target['id'], '全部回执发送已确认')
             self.note(target['user_id'], f'订单 {target["id"]} 回执已全部发送，扣除 {target["price"]} 积分。')
             for admin in self.admins:
-                self.note(admin, f'订单 {target["id"]} 完成交付。')
+                self.note(admin, f'订单 {target["id"]} 完成交付。', admin_only=True)
 
     @transactional
     def uncertain(self, message, reason):
@@ -370,7 +399,7 @@ class Service:
             else:
                 self.db.execute("UPDATE orders SET status='delivery_review' WHERE id=?", (target['id'],))
                 for admin in self.admins:
-                    self.note(admin, f'订单 {target["id"]} 交付待核实；消息记录 {message}。冻结积分保留，使用 /review 查看。')
+                    self.note(admin, f'订单 {target["id"]} 交付待核实；消息记录 {message}。冻结积分保留，使用 /review 查看。', admin_only=True)
 
     def _cancel_batch(self, batch):
         self.db.execute("UPDATE batches SET status='failed' WHERE id=?", (batch,))
@@ -402,6 +431,7 @@ class Service:
     def recover(self):
         for msg in self.db.all("SELECT id FROM messages WHERE status='sending'"):
             self._send_problem(msg['id'], 'unknown', '进程中断，发送结果未知')
+        self._cancel_unauthorized_outbox()
         self.db.execute("UPDATE payments SET status='unknown',reason='进程中断，创建结果未知' WHERE status='creating'")
         self.db.execute("UPDATE payments SET status='unknown',reason='进程中断，查单结果未知' WHERE id IN (SELECT payment_id FROM payment_jobs WHERE status='sending') AND status!='paid'")
         self.db.execute("UPDATE payment_jobs SET status='unknown' WHERE status='sending'")

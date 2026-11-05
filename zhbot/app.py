@@ -67,7 +67,7 @@ class Application:
                     self.s.audit(0, 'update_quarantined', number, '内部处理异常；原始内容不记录')
                     self.s.note(actor, '此条消息处理异常，业务变更已回滚。请联系管理员核实后重试。')
                     for admin in self.s.admins:
-                        self.s.note(admin, f'更新 {number} 已隔离，业务变更已回滚。请检查本地审计记录。')
+                        self.s.note(admin, f'更新 {number} 已隔离，业务变更已回滚。请检查本地审计记录。', admin_only=True)
             self.db.execute('INSERT INTO processed_updates(id,status,at) VALUES (?,?,?)', (number, status, self.s.clock()))
             self.db.execute("INSERT INTO settings(key,value) VALUES ('next_offset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(number + 1),))
             return True
@@ -112,7 +112,7 @@ class Application:
                 return
             if command == '/admin':
                 self.s.admin(actor)
-                self.s.note(actor, ADMIN_HELP)
+                self.s.note(actor, ADMIN_HELP, admin_only=True)
                 return
             self.s.user(actor)
             if command == '/balance':
@@ -121,7 +121,7 @@ class Application:
             elif command in {'/projects', '/adminprojects'}:
                 rows = self.s.projects(actor, command == '/adminprojects')
                 lines = [f'{r["id"]}: {r["title"]} · {r["price"]} 积分 · {"上架" if r["active"] else "下架"}' for r in rows]
-                self._lines(actor, lines or ['暂无项目。'])
+                self._lines(actor, lines or ['暂无项目。'], admin_only=command == '/adminprojects')
             elif command == '/project':
                 self.s.admin(actor)
                 args = body.split(maxsplit=3)
@@ -129,7 +129,7 @@ class Application:
                     raise RuleError('格式：/project new|项目ID 价格 on|off 名称')
                 project = None if args[0] == 'new' else parse_uint(args[0])
                 project = self.s.save_project(actor, project, args[3], args[1], args[2] == 'on')
-                self.s.note(actor, f'项目 {project} 已保存。')
+                self.s.note(actor, f'项目 {project} 已保存。', admin_only=True)
             elif command == '/new':
                 draft = self.s.new_draft(actor, self._args(body, 1)[0])
                 self.s.note(actor, f'草稿 {draft} 已建立，请发送材料；/draft 预览后确认才冻结积分。')
@@ -150,35 +150,36 @@ class Application:
                 self.s.cancel_draft(actor)
                 self.s.note(actor, '客户草稿已取消，未冻结积分。')
             elif command in {'/undo', '/clear'}:
+                selected = self.db.one('SELECT kind FROM selections WHERE actor=?', (actor,))
                 operation = self.s.undo_selected if command == '/undo' else self.s.clear_selected
                 operation(actor)
-                self.s.note(actor, '当前编辑内容已更新，请重新预览。')
+                self.s.note(actor, '当前编辑内容已更新，请重新预览。', admin_only=bool(selected and selected['kind'] == 'receipt'))
             elif command == '/orders':
                 page = parse_uint(body or '1', maximum=1_000_000)
                 if actor in self.s.admins:
                     rows = self.db.all('SELECT id,title,status,price FROM orders ORDER BY id DESC LIMIT 20 OFFSET ?', ((page - 1) * 20,))
                 else:
                     rows = self.db.all('SELECT id,title,status,price FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 20 OFFSET ?', (actor, (page - 1) * 20))
-                self._lines(actor, [f'{r["id"]}: {r["title"]} · {r["status"]} · {r["price"]} 积分' for r in rows] or ['暂无订单。'])
+                self._lines(actor, [f'{r["id"]}: {r["title"]} · {r["status"]} · {r["price"]} 积分' for r in rows] or ['暂无订单。'], admin_only=actor in self.s.admins)
             elif command == '/order':
                 row = self.s.order(actor, self._args(body, 1)[0])
                 summary = {'kind': 'text', 'content': f'订单 {row["id"]} · {row["title"]} · {row["status"]} · {row["price"]} 积分'}
-                self.s.batch(actor, actor, 'note', [summary] + row['items'])
+                self.s.batch(actor, actor, 'note', [summary] + row['items'], ref=row['id'], admin_only=row['user_id'] != actor)
             elif command == '/receipt':
                 self.s.open_receipt(actor, self._args(body, 1)[0])
-                self.s.note(actor, '已选择回执；发送文字、图片、文件继续编辑。/preview 订单ID 查看当前全部内容。')
+                self.s.note(actor, '已选择回执；发送文字、图片、文件继续编辑。/preview 订单ID 查看当前全部内容。', admin_only=True)
             elif command == '/preview':
                 self.s.preview_receipt(actor, self._args(body, 1)[0])
             elif command == '/deliver':
                 args = self._args(body, 2)
                 batch = self.s.deliver(actor, args[0], args[1])
-                self.s.note(actor, f'交付批次 {batch} 已登记；结果以订单状态为准。')
+                self.s.note(actor, f'交付批次 {batch} 已登记；结果以订单状态为准。', admin_only=True)
             elif command == '/fail':
                 args = body.split(maxsplit=1)
                 if len(args) != 2:
                     raise RuleError('格式：/fail 订单ID 原因')
                 self.s.fail_order(actor, args[0], args[1])
-                self.s.note(actor, '订单已终止，冻结积分已释放。')
+                self.s.note(actor, '订单已终止，冻结积分已释放。', admin_only=True)
             elif command == '/review':
                 self.s.admin(actor)
                 page = parse_uint(body or '1', maximum=1_000_000)
@@ -188,14 +189,14 @@ class Application:
                     ORDER BY m.id LIMIT 20 OFFSET ?""", ((page - 1) * 20,))
                 payments = self.db.all("SELECT id,status,reason FROM payments WHERE status IN ('unknown','review') ORDER BY created_at LIMIT 20 OFFSET ?", ((page - 1) * 20,))
                 self._lines(actor, [f'订单 {r["ref"]}，消息记录 {r["id"]}，{r["status"]}：{r["reason"]}' for r in rows]
-                            + [f'充值 {r["id"]}，{r["status"]}：{r["reason"]}' for r in payments] or ['暂无待核实项。'])
+                            + [f'充值 {r["id"]}，{r["status"]}：{r["reason"]}' for r in payments] or ['暂无待核实项。'], admin_only=True)
             elif command == '/resolve':
                 self.s.admin(actor)
                 args = body.split(maxsplit=2)
                 if len(args) != 3 or args[1] not in {'sent', 'failed'}:
                     raise RuleError('格式：/resolve 消息记录ID sent|failed 人工核实依据')
                 self.s.resolve(actor, args[0], args[1] == 'sent', args[2])
-                self.s.note(actor, '人工核实已记录，请通过 /order 查看最终状态。')
+                self.s.note(actor, '人工核实已记录，请通过 /order 查看最终状态。', admin_only=True)
             elif command == '/recharge':
                 payment = self.payments.request(actor, self._args(body, 1)[0])
                 self.s.note(actor, f'【离线模拟】充值单 {payment} 已登记。')
@@ -233,15 +234,15 @@ class Application:
             self.s.add_receipt_item(actor, kind, content, caption)
         else:
             self.s.add_customer_item(actor, kind, content, caption)
-        self.s.note(actor, '已保存一项内容；请完整预览后确认。')
+        self.s.note(actor, '已保存一项内容；请完整预览后确认。', admin_only=bool(selection and selection['kind'] == 'receipt'))
 
-    def _lines(self, actor, lines):
+    def _lines(self, actor, lines, *, admin_only=False):
         # Split listing output without splitting an attachment or Unicode surrogate pair.
         chunk = ''
         for line in lines:
             if len((chunk + '\n' + line).encode('utf-16-le')) // 2 > 3400:
-                self.s.note(actor, chunk)
+                self.s.note(actor, chunk, admin_only=admin_only)
                 chunk = ''
             chunk += ('\n' if chunk else '') + line
         if chunk:
-            self.s.note(actor, chunk)
+            self.s.note(actor, chunk, admin_only=admin_only)
