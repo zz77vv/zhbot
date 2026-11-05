@@ -32,21 +32,32 @@ class Telegram:
     MAX_RESPONSE = 8 * 1024 * 1024
 
     def __init__(self, token, opener=None):
-        # An HTTP-secret proxy may provide an opaque handle rather than the
-        # real Telegram token's shape. Validate a bounded safe path segment,
-        # preserve it byte-for-byte, and let getMe establish actual identity.
-        if type(token) is not str or not re.fullmatch(r'[A-Za-z0-9_:-]{1,512}', token):
+        # Preserve real-token validation; managed handles instead use one
+        # bounded, visible-ASCII transport segment, never a credential claim.
+        real_token = type(token) is str and re.fullmatch(r'[0-9]{5,20}:[A-Za-z0-9_-]{20,100}', token)
+        opaque_handle = (type(token) is str and 1 <= len(token) <= 64
+                         and all(33 <= ord(c) <= 126 and c not in '/\\?#%' for c in token))
+        if not (real_token or opaque_handle):
             raise RuleError('TELEGRAM_BOT_TOKEN 格式无效。')
-        self._base = 'https://api.telegram.org/bot' + token + '/'
+        # The literal 'bot' prefix ensures even a '.'/'..' handle is never a
+        # dot segment. Slash/backslash/percent/query/fragment cannot enter it.
+        self._path_prefix = '/bot' + token + '/'
+        self._base = 'https://api.telegram.org' + self._path_prefix
         # Keep proxy settings and default TLS certificate verification; forbid redirects.
         self._open = opener or build_opener(NoRedirect()).open
 
     def call(self, method, params, timeout=40):
         if method not in {'sendMessage', 'sendPhoto', 'sendDocument', 'getUpdates', 'getMe', 'getWebhookInfo', 'answerCallbackQuery'}:
             raise RuleError('不支持的 Telegram 操作。')
-        request = Request(self._base + method, data=json.dumps(params, ensure_ascii=True).encode(),
-                          headers={'Content-Type': 'application/json'}, method='POST')
         try:
+            target = self._base + method
+            request = Request(target, data=json.dumps(params, ensure_ascii=True).encode(),
+                              headers={'Content-Type': 'application/json'}, method='POST')
+            # Do not quote, strip, unwrap or normalize a proxy handle. Fail
+            # closed if the URL library changes the literal route or origin.
+            if (request.full_url != target or request.type != 'https' or request.host != 'api.telegram.org'
+                    or request.selector != self._path_prefix + method):
+                raise TelegramError('Telegram 请求目标无效；未发起请求。')
             http_error = None
             try:
                 response = self._open(request, timeout=timeout)

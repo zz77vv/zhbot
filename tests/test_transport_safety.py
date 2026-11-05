@@ -40,7 +40,7 @@ class PlaceholderTests(unittest.TestCase):
 
     def test_empty_unsafe_or_unbounded_handle_is_rejected_before_transport(self):
         for value in [None, True, 123, [], '', ' ', ' value', 'value ', 'a\nb', 'a\rb',
-                      'a/b', 'a\\b', 'a?b', 'a#b', 'a@b', 'a%2fb', 'a\x00b', '密钥',
+                      'a/b', 'a\\b', 'a?b', 'a#b', 'a%2fb', 'a\x00b', '密钥',
                       'a' * 513, 'https://private.invalid/token']:
             with self.subTest(value=repr(value)[:40]), self.assertRaises(RuleError):
                 Telegram(value, opener=lambda *a, **kw: self.fail('unsafe value reached transport'))

@@ -6,9 +6,10 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `python3 -m unittest discover -q` | 182 项测试通过，无失败/错误；Python 3.12.14 |
+| `python3 -m unittest discover -q` | 191 项测试通过，无失败/错误；Python 3.12.14 |
 | `python3 -m unittest tests.test_okpay tests.test_okpay_flows tests.test_payment_quarantine tests.test_payment_safety tests.test_payments -q` | 72 项协议与支付测试通过 |
 | `python3 -m unittest tests.test_okpay tests.test_okpay_flows -q` | 28 项新协议与流程测试通过 |
+| `python3 -m unittest tests.test_proxy_handles -q` | 9 项标点句柄/路径/请求字节/脱敏回归通过 |
 | `python3 -m unittest tests.test_transport_safety -q` | 10 项代理句柄与回调确认分类/幂等回归通过 |
 | `python3 -m unittest tests.test_payment_review_ui -q` | 6 项充值隔离详情回归通过 |
 | `python3 -m unittest tests.test_adjustments tests.test_ui tests.test_ui_transport tests.test_ui_migration -q` | 32 项菜单、积分调整、传输与迁移测试通过 |
@@ -17,7 +18,7 @@
 | `python3 -m compileall -q zhbot tests` | 通过 |
 | `git diff --check` | 通过 |
 
-182 是当前 unittest 测试方法数（本轮前基线为 172，新增 10）；其中多个方法还覆盖多组异常输入或所有 5 个回执位置的崩溃子场景，不把子场景另计为测试数量。
+191 是当前 unittest 测试方法数（本轮前基线为 182，新增 9）；其中多个方法还覆盖多组异常输入或所有 5 个回执位置的崩溃子场景，不把子场景另计为测试数量。
 
 ## 覆盖与阶段证据
 
@@ -142,6 +143,20 @@ schema 5 增加 reply_markup、UI 状态/动作、回调去重和人工调整记
 新增10项测试，首批9项中7项缺失功能失败、2项保守对照通过；另增加非布尔 transport 结果的5个子场景，先复现被误记 done，再收紧为只有 True 才 done。真实菜单确认人工加2后模拟旧 ACK400，恢复并重复 callback/update，确认只尝试一次、积分仍12、账本/调整记录各1；没有重放业务。
 
 本轮实际执行：专项10项、完整182项通过；demo仍为 completed/可用2/冻结0/3条账变/5项回执，compileall、git diff --check通过。独立审阅在 socket连接阻断下跑26项传输/runtime相关测试通过，未发现阻塞的正确性、幂等或密钥日志问题。未发起真实 Telegram 或支付请求，未部署、未合并；实际代理句柄与供应商错误描述兼容性仍须获得脱敏格式并在另行批准的隔离测试核对，不能从本离线夹具宣称线上通过。
+
+### 不透明句柄标点与固定路径语义（2026-11-05）
+
+上游再次提供无网络诊断，仅披露实际句柄的非秘密类别：长度1～64，无空白、控制字符、非ASCII或斜线/反斜线/问号/井号/百分号，但含前版排除的其他ASCII标点。此任务明确不索取或读取句柄值，沿用该类别作为兼容输入边界；没有再请求实际前缀或值。
+
+修复：保留严格真实 token 格式（5～20数字、冒号、20～100字母数字/下划线/连字符）；其他候选句柄限1～64个可见ASCII，排除上述5种分隔/编码字符。输入形状本身不认证secret。原值嵌入固定 `https://api.telegram.org/bot…/方法`，不quote/strip/解码/归一化。Request构造移入脱敏异常边界，并在调用传输前核对固定HTTPS主机、完整字面URL及selector；异常内部_base变更也被拒绝。
+
+路径分析：token处于已固定origin后的单个path段。`@`、冒号、方括号不会改变authority；分号/与号/等号是字面路径内容；点/双点前有bot前缀，实际段不是`.`或`..`。新段、编码分隔、查询、片段、HTTP空白/头注入均由字符边界拒绝。对于一般URI规范之外的其他可见标点，提供的是管理代理前的字面传输，不假定所有下游实现都认可；上游可拒绝未替换的句柄。
+
+新增9项测试：遍历全部允许可见ASCII和组合标点；点段、保留分隔符、短句柄1/64边界与超长拒绝、真实token最大合法形状；全部C0/空格/DEL、Unicode/代理字符、URL分隔与多层编码拒绝。读取合成 Request 的origin/path/selector，使用 stdlib HTTPSConnection 配合仅收集字节的假socket检验实际HTTP请求行原样和唯一固定Host（无TLS连接/网络），另覆盖内部URL构造变化、Request构造异常携带URL时的脱敏、普通400/401/403/429/5xx及状态冲突的原有分类、错误traceback/标准错误脱敏和main身份失败退出。
+
+初轮暴露5个断言失败及55个异常子场景（不按子场景计测试数）；修复后专项9项、与前轮传输相关19项、完整191项通过。demo仍completed/可用2/冻结0/3条账变/5项回执；compileall、git diff --check通过。独立审阅在connect/create_connection阻断下跑34项相关测试通过，无阻塞代码发现；指出的旧输入范围文档已同步更新。
+
+未访问或传输任何实际凭据/句柄，没有真实Telegram或支付请求，没有改动回调400分类、支付门槛、代理/CA/重定向策略，没有部署或合并。实际管理代理对标点的替换/解析兼容性仍需上游另行授权的隔离验证，本轮只证明本地解析和HTTP请求字节不变化。
 
 ## 尚未验证或交付的能力
 
