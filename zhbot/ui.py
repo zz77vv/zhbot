@@ -1,5 +1,6 @@
 """Persistent Chinese inline menus. Callback tokens carry no trusted user input."""
 import json
+import hashlib
 import re
 import secrets
 
@@ -225,10 +226,12 @@ class GuidedUI:
     def review(self, actor, page=0):
         self.s.admin(actor)
         page = parse_uint(page, minimum=0, maximum=1_000_000)
-        rows = self.db.all("""SELECT 'delivery' kind,CAST(m.id AS TEXT) ref,b.ref order_id,m.status FROM messages m
+        rows = self.db.all("""SELECT 'delivery' kind,CAST(m.id AS TEXT) ref,b.ref order_id,m.status,0 quarantined FROM messages m
             JOIN batches b ON b.id=m.batch_id JOIN orders o ON o.id=b.ref
             WHERE b.kind='delivery' AND o.status='delivery_review' AND m.status IN ('unknown','failed')
-            UNION ALL SELECT 'payment',p.id,NULL,p.status FROM payments p WHERE p.status IN ('unknown','review','closed_review','expired')
+            UNION ALL SELECT 'payment',p.id,NULL,p.status,
+            EXISTS (SELECT 1 FROM payment_identity_sightings x WHERE x.payment_id=p.id AND x.quarantined=1)
+            FROM payments p WHERE p.status IN ('unknown','review','closed_review','expired')
             OR EXISTS (SELECT 1 FROM payment_identity_sightings x WHERE x.payment_id=p.id AND x.quarantined=1)
             ORDER BY kind,ref LIMIT 9 OFFSET ?""", (page*self.PAGE,))
         buttons = []
@@ -236,10 +239,76 @@ class GuidedUI:
             if r['kind'] == 'delivery':
                 buttons.append(button(f'订单 {r["order_id"]} · {status_label(r["status"])}', 'inspect', {'id': r['order_id']}))
             else:
-                buttons.append(button(f'充值 {r["ref"][:12]} · {status_label(r["status"])}', 'payment_review', {'id': r['ref']}))
+                buttons.append(button(f'充值 {r["ref"][:12]} · {status_label(r["status"])}' + (' · 身份隔离' if r['quarantined'] else ''), 'payment_review', {'id': r['ref']}))
         buttons += self.pages('review', page, len(rows) > self.PAGE)
         buttons.append(button('返回管理菜单', 'admin'))
         self.show(actor, '待核实事项：先检查证据，不能凭未知结果重发或入账。' if rows else '暂无待核实事项。', buttons, admin=True)
+
+    def _payment_close_allowed(self, row):
+        return (row['status'] in {'unknown', 'review', 'expired', 'closed_review'}
+                and not self.db.one("SELECT id FROM payment_jobs WHERE payment_id=? AND status='sending'", (row['id'],)))
+
+    @staticmethod
+    def _identity_fingerprint(value):
+        # Only a short stable comparison aid leaves the database, never raw
+        # platform/transaction IDs, arbitrary identity contents or other owners.
+        return hashlib.sha256(value.encode('utf-8', errors='backslashreplace')).hexdigest()[:12]
+
+    @staticmethod
+    def _payment_fact_summary(raw, row):
+        try:
+            if type(raw) is not str or len(raw) > 8192:
+                raise ValueError
+            facts = json.loads(raw)
+            if type(facts) is not dict or facts.get('verified') is not True or facts.get('unique_id') != row['id']:
+                raise ValueError
+        except (ValueError, RecursionError):
+            return '摘要不可用；身份记录仍保留，请查本地审计。'
+        # Whitelist bounded business facts from the sighting itself. A same-job
+        # conflicting replay has its own evidence, unlike its first observation.
+        value = facts.get('status')
+        status = {0: '未付', 1: '已付'}.get(value, '不可用') if type(value) is int else '不可用'
+        amount = facts.get('amount')
+        amount = str(amount) if type(amount) in {str, int} else ''
+        if len(amount) > 32 or not re.fullmatch(r'[0-9]{1,7}(?:\.[0-9]{1,8})?', amount):
+            amount = '不可用'
+        coin = facts.get('coin')
+        coin = coin if type(coin) is str and coin in {'USDT', 'TRX', 'CNY'} else '不可用'
+        payer = facts.get('payer')
+        payer = ('匹配' if payer == row['user_id'] else '不匹配') if type(payer) is int else '缺失/无效'
+        return f'内部状态 {status} · 金额 {amount} · 币种 {coin} · 付款人 {payer}'
+
+    def payment_review(self, actor, data):
+        self.s.admin(actor)
+        row = self.app.payments._get(data['id'])
+        page = parse_uint(data.get('page', 0), minimum=0, maximum=1_000_000)
+        counts = self.db.one('SELECT COUNT(*) total,COALESCE(SUM(quarantined),0) quarantined FROM payment_identity_sightings WHERE payment_id=?', (row['id'],))
+        lines = [f'充值 {row["id"]} · {status_label(row["status"])}\n本地申请 {row["amount"]} USDT']
+        if counts['quarantined']:
+            lines.append(f'⚠ 身份隔离：{counts["quarantined"]} 条记录，需人工对账。既有入账不自动撤销，不重复加分、不自动退款或解除隔离。')
+        if row['reason']:
+            lines.append('已有本地处置说明；自由文本可能含个人信息，完整文字请查本地审计。')
+        claims = {r['kind']: r['value'] for r in self.db.all('SELECT kind,value FROM payment_identity_claims WHERE payment_id=?', (row['id'],))}
+        records = self.db.all('SELECT * FROM payment_identity_sightings WHERE payment_id=? ORDER BY id LIMIT 9 OFFSET ?', (row['id'], page*self.PAGE))
+        lines.append(f'历史内部证据 {counts["total"]} 条（非重新验签）。身份仅显示指纹用于比对；本地观察时间不等于实际付款时间。')
+        if not records:
+            lines.append('本页无已认证身份记录；不把未认证原始观察当作付款证明。')
+        for record in records[:self.PAGE]:
+            name = '平台' if record['kind'] == 'platform' else '结算'
+            claim = claims.get(record['kind'])
+            comparison = '无原认领' if claim is None else '与原认领一致' if claim == record['value'] else '与原认领不同'
+            lines.append(f'记录 {record["id"]} · 观察 {record["observation_id"]} · {name}指纹 {self._identity_fingerprint(record["value"])} · {"已隔离" if record["quarantined"] else "仅记录"}\n'
+                         f'{comparison} · 本地观察秒 {record["observed_at"]}\n' + self._payment_fact_summary(record['evidence'], row))
+        buttons = self.pages('payment_review', page, len(records) > self.PAGE, {'id': row['id']})
+        if self._payment_close_allowed(row):
+            buttons.append(button('填写本地关闭依据', 'payment_reason', {'id': row['id']}))
+        elif row['status'] == 'paid':
+            lines.append('本单已入账，不能本地关闭；请按保留的身份与账本人工对账。')
+        elif self.db.one("SELECT id FROM payment_jobs WHERE payment_id=? AND status='sending'", (row['id'],)):
+            lines.append('支付任务仍在执行，暂不能本地关闭。')
+        lines.append('本地关闭不加分、不退款、不代表上游取消；完整证据保留本地，不在聊天发送原始响应、付款人 ID、商户、链接或令牌。')
+        buttons.append(button('返回待核实', 'review'))
+        self.show(actor, '\n\n'.join(lines), buttons, admin=True)
 
     def callback(self, actor, query):
         data = query.get('data')
@@ -338,12 +407,12 @@ class GuidedUI:
         elif command == 'resolve_confirm':
             self.s.resolve(actor, data['id'], data['delivered'], data['reason'])
             self.inspect(actor, {'id': data['order']})
-        elif command == 'payment_review':
+        elif command == 'payment_review': self.payment_review(actor, data)
+        elif command == 'payment_reason':
             self.s.admin(actor)
-            row = self.app.payments._get(data['id'])
-            self.show(actor, f'充值 {row["id"]}\n用户 {row["user_id"]} · {row["status"]}\n依据：{row["reason"]}\n本地关闭不加分、不退款、不代表上游取消。',
-                [button('填写本地关闭依据', 'payment_reason', data), button('返回待核实', 'review')], admin=True)
-        elif command == 'payment_reason': self.prompt(actor, '请输入人工核实依据；只关闭本地异常单。', 'payment_reason', data)
+            if not self._payment_close_allowed(self.app.payments._get(data['id'])):
+                raise RuleError('当前状态或执行中的任务不允许关闭，请重新查看详情。')
+            self.prompt(actor, '请输入人工核实依据；只关闭本地异常单。', 'payment_reason', data)
         elif command == 'payment_confirm': self.app.payments.close_no_credit(actor, data['id'], data['reason']); self.review(actor)
         else: raise RuleError('不支持的按钮操作，请发送 /menu。')
 

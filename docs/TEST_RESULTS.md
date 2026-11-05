@@ -6,16 +6,17 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `python3 -m unittest discover -q` | 166 项测试通过，无失败/错误；Python 3.12.14 |
+| `python3 -m unittest discover -q` | 172 项测试通过，无失败/错误；Python 3.12.14 |
 | `python3 -m unittest tests.test_okpay tests.test_okpay_flows tests.test_payment_quarantine tests.test_payment_safety tests.test_payments -q` | 72 项协议与支付测试通过 |
 | `python3 -m unittest tests.test_okpay tests.test_okpay_flows -q` | 28 项新协议与流程测试通过 |
+| `python3 -m unittest tests.test_payment_review_ui -q` | 6 项充值隔离详情回归通过 |
 | `python3 -m unittest tests.test_adjustments tests.test_ui tests.test_ui_transport tests.test_ui_migration -q` | 32 项菜单、积分调整、传输与迁移测试通过 |
 | `python3 -m unittest tests.test_outbox_auth tests.test_app tests.test_delivery -q` | 35 项相关测试通过 |
 | `python3 -m zhbot demo` | 离线端到端完成；订单 completed、可用 2、冻结 0、3 条账变、5 项回执 |
 | `python3 -m compileall -q zhbot tests` | 通过 |
 | `git diff --check` | 通过 |
 
-166 是当前 unittest 测试方法数（本轮前基线为 134，新增 32）；其中多个方法还覆盖多组异常输入或所有 5 个回执位置的崩溃子场景，不把子场景另计为测试数量。
+172 是当前 unittest 测试方法数（本轮前基线为 166，新增 6）；其中多个方法还覆盖多组异常输入或所有 5 个回执位置的崩溃子场景，不把子场景另计为测试数量。
 
 ## 覆盖与阶段证据
 
@@ -116,6 +117,18 @@ RED/修复证据：积分服务缺失时 6 项测试失败；缺少菜单时 7 �
 schema 5 增加 reply_markup、UI 状态/动作、回调去重和人工调整记录；schema4 升级保留余额、账本、旧队列，原 schema1/2/3 迁移测试仍通过，未知数据库拒绝。
 
 提交 config/zhbot.env.example、config/zhbot.service.example 和 OPERATIONS.md；模板无凭据，未安装或启用。审阅发现 PrivateTmp 会隔离既有同用户机器人锁，已移除并明确共享临时路径的运行约束；ProtectSystem=strict 显式放行状态目录和 /tmp。服务配置只静态审阅，没有实机启动验证。备份示例由独立审阅在活动 WAL 数据库离线验证，保存提交数据、integrity_check 通过、权限0600且拒绝覆盖已有目标。没有执行服务器备份或恢复。
+
+### 已入账充值的冲突详情可见性（2026-11-05）
+
+独立产品审阅复现：已正常入账后，同一 check job 重放已认证的新结算身份；四条 sightings 已隔离，paid 与空 reason 按安全策略保留，但 UI 列表未标隔离、详情只读主表并无条件显示关闭按钮。账本没有错误，问题在详情未读取隔离证据及未按当前状态构造操作。
+
+新增 6 项回归，首次 5 项失败、1 项现有权限对照通过。修复后列表标“身份隔离”，详情分页读取当前单的每条 sighting 自身证据，显示隔离条数、平台/结算短指纹、与原认领的相同/不同、本地观察秒及白名单内的状态/金额/币种/付款人匹配摘要。同 job 的冲突记录不会误用首次 observation 的旧事实。短指纹仅供辅助比对，不作身份唯一证明或交易认证；原始身份与完整证据仍保留本地。
+
+仅当前管理员私聊可见；不发送原始身份/JSON、其他单的证据、付款人 ID、商户、令牌、支付链接。自由文本处置原因也仅提示存在，完整内容查本地审计；扩展隐私断言先复现旧原因会回显，再移除自由文本回显。格式坏/不符合内部 verified 与本地单关联的摘要不会成为业务事实，仍保留身份警告。分页有界，观察时间明确不代表实际付款时间。
+
+已入账或其他不可关闭状态不显示关闭按钮，执行中的任务暂不显示；进入填写依据步骤时再次核对状态与任务，最终仍由 close_no_credit 校验。没有修改支付状态机、账本、已有认领或隔离；已入账不自动倒转、不重复加分、不自动退款。真实入口仍 DisabledGateway。
+
+实际执行：`python3 -m unittest tests.test_payment_review_ui -q` 6 项、`python3 -m unittest discover -q` 172 项通过；demo 仍为 completed/可用2/冻结0/3条账变/5项回执，compileall 和 git diff --check 通过。独立代码审阅复核完整172项并检查白名单/分页/关闭门槛，无实质性发现；最后移除自由文本原因回显后，再由实现者重跑全套172项。无真实支付、部署或合并。
 
 ## 尚未验证或交付的能力
 
