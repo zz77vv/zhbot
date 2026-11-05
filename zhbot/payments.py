@@ -10,6 +10,7 @@ import re
 import uuid
 
 from .core import MAX_ID, MAX_POINTS, RuleError, bounded_text, parse_uint
+from .store import identity_conflicts, quarantine_identities
 
 
 @dataclass(frozen=True)
@@ -197,21 +198,35 @@ class Payments:
             if current is None:
                 raise RuleError('支付任务不存在。')
             row = self._get(current['payment_id'])
-            if not self.db.execute('INSERT OR IGNORE INTO payment_observations(job_id,payment_id,observed_at,evidence) VALUES (?,?,?,?)',
-                                   (current['id'], row['id'], observed_at, self._safe_evidence(evidence))).rowcount:
-                return False
-            if row['status'] == 'paid':
-                self.s.audit(0, 'payment_duplicate_observation', row['id'], '已经入账，不重复处理')
-                return False
+            encoded = self._safe_evidence(evidence)
+            duplicate = not self.db.execute('INSERT OR IGNORE INTO payment_observations(job_id,payment_id,observed_at,evidence) VALUES (?,?,?,?)',
+                                           (current['id'], row['id'], observed_at, encoded)).rowcount
+            observation = self.db.one('SELECT id FROM payment_observations WHERE job_id=?', (current['id'],))
             stale = current['status'] != 'sending'
-            if not stale:
+            if not stale and not duplicate:
                 self.db.execute("UPDATE payment_jobs SET status='done' WHERE id=?", (current['id'],))
-            if not self._bound(row, evidence):
-                self._review(row, '来源或订单关联未通过核实')
+            if not self._authenticated(row, evidence):
+                if not duplicate:
+                    self._review(row, '来源或订单关联未通过核实')
                 return False
             transaction = evidence.transaction_id if type(evidence.status) is int and evidence.status == 1 and self._identity(evidence.transaction_id) else None
-            if not self._reserve_identities(row, evidence.platform_id, transaction):
-                self._review(row, '平台订单或结算交易身份已经关联其他充值单，或同单证据冲突')
+            values = ([('platform', evidence.platform_id)] if self._identity(evidence.platform_id) else []) + ([('transaction', transaction)] if transaction else [])
+            new_sightings = 0
+            for kind, value in values:
+                new_sightings += self.db.execute('INSERT OR IGNORE INTO payment_identity_sightings(observation_id,payment_id,kind,value,observed_at,evidence) VALUES (?,?,?,?,?,?)',
+                                                (observation['id'], row['id'], kind, value, observed_at, encoded)).rowcount
+            if not self._bound(row, evidence) or not self._reserve_identities(row, evidence.platform_id, transaction):
+                changed = quarantine_identities(self.db.connection, row['id'])
+                if changed or new_sightings or not duplicate:
+                    self.s.audit(0, 'payment_identity_quarantined', row['id'], '已认证身份矛盾或关联不完整；保留全部身份，禁止自动复用')
+                    self._review(row, '平台订单或结算交易身份已经关联其他充值单，或同单证据冲突')
+                    for admin in self.s.admins:
+                        self.s.note(admin, f'充值单 {row["id"]} 身份出现隔离记录；请 /review 核实。既有入账不自动撤销。', admin_only=True)
+                return False
+            if duplicate:
+                return False  # Identity contradictions above still count on a replay.
+            if row['status'] == 'paid':
+                self.s.audit(0, 'payment_duplicate_observation', row['id'], '已经入账，不重复处理')
                 return False
             if row['platform_id'] is None:
                 self.db.execute('UPDATE payments SET platform_id=? WHERE id=?', (evidence.platform_id, row['id']))
@@ -260,6 +275,8 @@ class Payments:
         return type(value) is str and 0 < len(value) <= 128 and bool(value.strip())
 
     def _reserve_identities(self, row, platform, transaction):
+        if identity_conflicts(self.db.connection, row['id']):
+            return False
         identities = [('platform', platform)] + ([('transaction', transaction)] if transaction else [])
         for kind, value in identities:
             owner = self.db.one('SELECT payment_id FROM payment_identity_claims WHERE kind=? AND value=?', (kind, value))
@@ -277,11 +294,14 @@ class Payments:
         return True
 
     def _bound(self, row, evidence):
-        return (isinstance(evidence, Evidence) and evidence.verified is True
-                and evidence.merchant == self.gateway.merchant
-                and evidence.unique_id == row['id']
+        return (self._authenticated(row, evidence)
                 and self._identity(evidence.platform_id)
                 and (row['platform_id'] is None or row['platform_id'] == evidence.platform_id))
+
+    def _authenticated(self, row, evidence):
+        return (isinstance(evidence, Evidence) and evidence.verified is True
+                and evidence.merchant == self.gateway.merchant
+                and evidence.unique_id == row['id'])
 
     def _review(self, row, reason, status='review', action=None):
         if row['status'] == 'paid':

@@ -188,7 +188,12 @@ class Application:
                     JOIN batches b ON b.id=m.batch_id JOIN orders o ON o.id=b.ref
                     WHERE b.kind='delivery' AND o.status='delivery_review' AND m.status IN ('unknown','failed')
                     ORDER BY m.id LIMIT 20 OFFSET ?""", ((page - 1) * 20,))
-                payments = self.db.all("SELECT id,status,reason FROM payments WHERE status IN ('unknown','review','closed_review') ORDER BY created_at LIMIT 20 OFFSET ?", ((page - 1) * 20,))
+                payments = self.db.all("""SELECT p.id,p.status,
+                    CASE WHEN EXISTS (SELECT 1 FROM payment_identity_sightings s WHERE s.payment_id=p.id AND s.quarantined=1)
+                    THEN '身份有隔离记录，需人工对账；既有入账不自动撤销。' || p.reason ELSE p.reason END AS reason
+                    FROM payments p WHERE p.status IN ('unknown','review','closed_review')
+                    OR EXISTS (SELECT 1 FROM payment_identity_sightings s WHERE s.payment_id=p.id AND s.quarantined=1)
+                    ORDER BY p.created_at LIMIT 20 OFFSET ?""", ((page - 1) * 20,))
                 self._lines(actor, [f'订单 {r["ref"]}，消息记录 {r["id"]}，{r["status"]}：{r["reason"]}' for r in rows]
                             + [f'充值 {r["id"]}，{r["status"]}：{r["reason"]}' for r in payments] or ['暂无待核实项。'], admin_only=True)
             elif command == '/resolve':
