@@ -1,7 +1,8 @@
 """Fail-closed payment boundary. There is deliberately no live OKPay adapter.
 
-Evidence below is an INTERNAL simulation contract, not an OKPay API schema.
-Only a future reviewed adapter could establish its provenance and semantics.
+Evidence below is an INTERNAL facts contract, not an OKPay API schema.
+The separate offline okpay module authenticates a documented subset; missing
+settlement identity/time stay absent. No live adapter establishes provenance.
 """
 from dataclasses import dataclass, fields
 from decimal import Decimal
@@ -25,7 +26,7 @@ class Evidence:
     merchant: str
     unique_id: str
     platform_id: str
-    status: int
+    status: int | None
     amount: object = None
     coin: str | None = None
     payer: int | None = None
