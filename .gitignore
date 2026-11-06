@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bot runtime data and credentials
+*.sqlite*
+*.db*
+*.lock
+*.log
