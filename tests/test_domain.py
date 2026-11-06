@@ -1,0 +1,63 @@
+import tempfile
+import unittest
+from pathlib import Path
+from zhbot.store import Store, DomainError
+
+class Fixture:
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.s = Store(Path(self.tmp.name) / 'test.db', 99)
+        self.p = self.s.save_product(99, dict(name='查询', price=3, description='介绍', eta='人工', fields=[{'name':'资料','kind':'text'}]))
+        self.s.adjust(99, 1, 10, '线下收款', 'seed')
+    def tearDown(self):
+        self.tmp.cleanup()
+    def draft(self, text='a\nb'):
+        d=self.s.new_draft(1,self.p)
+        self.s.set_field(1,d,0,{'kind':'text','text':text})
+        return d
+
+class DomainTests(Fixture, unittest.TestCase):
+    def test_batch_idempotent_freeze(self):
+        d=self.draft(); b=self.s.confirm(1,d)
+        self.assertEqual(b,self.s.confirm(1,d))
+        self.assertEqual((4,6),self.s.balance(1))
+        self.assertEqual(2,len(self.s.orders(b)))
+        self.assertEqual(1,len(self.s.events()))
+    def test_insufficient_rejects_whole_batch_and_invalidates(self):
+        d=self.draft('a\nb\nc\nd')
+        with self.assertRaises(DomainError): self.s.confirm(1,d)
+        self.assertEqual((10,0),self.s.balance(1))
+        self.assertEqual([],self.s.orders())
+        with self.assertRaises(DomainError): self.s.confirm(1,d)
+    def test_receipts_staged_then_settled_and_summary(self):
+        b=self.s.confirm(1,self.draft()); a,c=self.s.orders(b)
+        self.s.add_receipt(99,a['id'],{'kind':'text','text':'done'})
+        self.assertEqual((4,6),self.s.balance(1))
+        self.s.begin_delivery(99,a['id'])
+        r=self.s.receipts(a['id'])[0]
+        self.s.mark_sending(r['id']); self.s.mark_sent(r['id'],123)
+        self.s.settle(a['id']); self.s.settle(a['id'])
+        self.s.refund(99,c['id'],'empty','')
+        self.assertEqual((7,0),self.s.balance(1))
+        self.assertEqual(1,len([e for e in self.s.events() if e['kind']=='summary']))
+    def test_uncertain_blocks_refund_and_replay(self):
+        o=self.s.orders(self.s.confirm(1,self.draft('x')))[0]['id']
+        self.s.add_receipt(99,o,{'kind':'text','text':'ok'})
+        self.s.begin_delivery(99,o); r=self.s.receipts(o)[0]['id']
+        self.s.mark_sending(r); self.s.recover()
+        with self.assertRaises(DomainError): self.s.refund(99,o,'cancel','')
+        with self.assertRaises(DomainError): self.s.begin_delivery(99,o)
+        self.assertEqual((7,3),self.s.balance(1))
+    def test_permissions_and_adjust_idempotence(self):
+        with self.assertRaises(DomainError): self.s.adjust(2,1,10,'bad','bad')
+        self.s.adjust(99,1,-2,'纠正','fix'); self.s.adjust(99,1,-2,'纠正','fix')
+        self.assertEqual((8,0),self.s.balance(1))
+        with self.assertRaises(DomainError): self.s.confirm(2,self.draft())
+    def test_product_order_snapshot_and_offline(self):
+        p2=self.s.save_product(99,dict(name='第二',price=1,description='',eta='',fields=[{'name':'资料','kind':'text'}]))
+        self.s.move_product(99,p2,-1)
+        self.assertEqual(p2,self.s.products()[0]['id'])
+        b=self.s.confirm(1,self.draft('x'))
+        self.s.save_product(99,dict(self.s.product(self.p),price=5,active=0))
+        self.assertEqual(3,self.s.orders(b)[0]['price'])
+        with self.assertRaises(DomainError): self.s.new_draft(1,self.p)
