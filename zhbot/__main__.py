@@ -7,9 +7,10 @@ from .store import Store
 from .telegram import Telegram
 from .app import App
 from .runtime import Runtime
+from .config import build_payments
 
 def main():
-    parser=argparse.ArgumentParser(description='Telegram 报单机器人（OKPay 集成待完成）')
+    parser=argparse.ArgumentParser(description='Telegram 报单机器人（OKPay 默认关闭）')
     parser.add_argument('command',choices=['run','migrate','backup','check'])
     parser.add_argument('--destination',help='backup target')
     args=parser.parse_args()
@@ -26,10 +27,10 @@ def main():
             if not args.destination: parser.error('--destination required')
             s.backup(args.destination); print('Backup completed')
         elif args.command=='check':
-            print(s.rows('PRAGMA integrity_check')); print('OKPay: BLOCKED (official SDK/contract not yet verified)')
+            print(s.rows('PRAGMA integrity_check')); payments=build_payments(s); print('OKPay: configured (live validation pending)' if payments else 'OKPay: disabled')
         elif args.command=='run':
             logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
-            t=Telegram(os.environ.get('BOT_TOKEN','')); Runtime(s,App(s,t),t).run()
+            payments=build_payments(s); t=Telegram(os.environ.get('BOT_TOKEN','')); Runtime(s,App(s,t,payments),t).run()
         else: print('Migrations completed')
 
 if __name__=='__main__': main()

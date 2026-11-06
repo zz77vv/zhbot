@@ -119,8 +119,12 @@ class App:
             for e in self.s.events():
                 if e['state']=='uncertain': self.send(u,f"待核实通知事件 {e['id']} / {e['kind']}")
         elif action=='topup':
-            if not self.payments: raise DomainError('OKPay 尚未完成官方协议与真实联调，充值未开放。')
-            self.s.set_session(u,{'mode':'topup'}); self.send(u,'输入充值整数 USDT，最低 1 USDT（1 USDT = 1 积分）。')
+            if not self.payments: raise DomainError('OKPay 充值暂未开放，请联系管理员。')
+            self.s.set_session(u,{'mode':'topup'}); self.send(u,'输入充值整数 USDT，最低 1 USDT（1 USDT = 1 积分）。创建结果待核实时请先检查原订单。')
+            self.payment_history(u,0)
+        elif action=='payhistory':
+            if not self.payments: raise DomainError('支付服务未开放')
+            self.payment_history(u,int(args[0]))
         elif action=='checkpay':
             if not self.payments: raise DomainError('支付服务未开放')
             self.send(u,self.payments.check(u,args[0]))
@@ -146,6 +150,12 @@ class App:
         if text in ('/start','/products'): self.s.set_session(u,{}); self.home(u); return
         if text=='/admin': self.s.set_session(u,{}); self.admin_home(u); return
         if text=='/balance': self.send(u,'可用/冻结：'+str(self.s.balance(u))); return
+        if text.startswith('/paymentlink '):
+            self.s.admin(u)
+            if not self.payments: raise DomainError('支付服务未开放')
+            _,pid,platform,url,reason=text.split(' ',4)
+            self.payments.attach_link(u,pid,platform,url,reason)
+            self.send(u,'原充值订单链接已恢复；未加积分，客户仍须付款并查单。'); return
         if text.startswith('/adjust '):
             self.s.admin(u); _,customer,amount,reason=text.split(' ',3)
             n=int(amount)
@@ -198,8 +208,22 @@ class App:
         elif mode=='topup':
             if not self.payments: raise DomainError('支付未开放')
             order=self.payments.create(u,int(text)); self.s.set_session(u,{})
-            self.t.call('sendMessage',chat_id=u,text='充值订单 '+order['id'],reply_markup={'inline_keyboard':[[{'text':'支付订单','url':order['url']}],[{'text':'检查支付状态','callback_data':'checkpay:'+order['id']}]]})
+            self.payment_view(u,self.s.one('SELECT * FROM payments WHERE id=? AND user_id=?',(order['id'],u)))
         else: self.send(u,'请先选择商品；管理员请回复订单详情暂存回单。',[[('商品列表','home')]])
+    def payment_history(self,u,page):
+        for order in self.payments.recent(u,page): self.payment_view(u,order)
+        buttons=[]
+        if page>0: buttons.append(('上一页','payhistory:'+str(page-1)))
+        if self.payments.recent(u,page+1): buttons.append(('下一页','payhistory:'+str(page+1)))
+        if buttons: self.send(u,'充值历史 · 第 '+str(page+1)+' 页',[buttons])
+    def payment_view(self,u,order):
+        buttons=[]
+        if order.get('url') and order['state']=='pending':
+            buttons.append([{'text':'支付订单','url':order['url']}])
+        if not order.get('url') and order['state']!='credited':
+            self.send(u,'原订单创建结果待核实，请先检查支付状态。待付但缺少链接时，请联系管理员从商户后台核对恢复。')
+        buttons.append([{'text':'检查支付状态','callback_data':'checkpay:'+order['id']}])
+        self.t.call('sendMessage',chat_id=u,text=f"充值订单 {order['id']}\n{order['amount']} USDT = {order['amount']} 积分\n状态 {order['state']}（允许代付）",reply_markup={'inline_keyboard':buttons})
     def deliver(self):
         for o in self.s.rows("SELECT * FROM orders WHERE status='delivering'"):
             try:
@@ -222,6 +246,7 @@ class App:
                 text=f"新批次 {p['batch']}\n商品：{product['name']}\n客户 {first['user_id']} · {len(orders)} 笔 · 总冻结 {sum(o['price'] for o in orders)} 积分\n创建 {created} UTC · 待处理"
                 if len(orders)==1: text+='\n订单 '+first['id']
                 rows=[[('展开子订单','batch:'+p['batch'])]]
+            elif e['kind']=='credited': text=f"充值已入账 {p['points']} 积分\n充值订单 {p['payment']}"
             elif e['kind']=='summary': text=f"批次 {p['batch']} 全部结束\n成功 {p['success']}，空单/退款 {p['refund']}，扣分 {p['charged']}，退分 {p['returned']}"
             else: text=f"订单 {p['order']} 已退 {p['points']} 积分\n{p['reason']}"
             with self.s.tx() as c:

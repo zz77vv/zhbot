@@ -1,0 +1,45 @@
+[
+  {
+    "params": {
+      "id": 10001,
+      "timestamp": 1700000000,
+      "nonce": "0123456789abcdef",
+      "amount": "100.50",
+      "coin": "USDT",
+      "unique_id": "case-1"
+    },
+    "base": "amount=100.50&coin=USDT&id=10001&nonce=0123456789abcdef&timestamp=1700000000&unique_id=case-1",
+    "signature": "6F7E8AFB94A98349C30B068423A81B7695C872D2C261124F3667ABBC51B50BCF"
+  },
+  {
+    "params": {
+      "status": "success",
+      "code": 200,
+      "id": 10001,
+      "data": {
+        "order_id": "platform-demo",
+        "unique_id": "case-2",
+        "amount": "1.00",
+        "coin": "USDT",
+        "status": 1,
+        "pay_user_id": 987654321
+      }
+    },
+    "base": "code=200&data.amount=1.00&data.coin=USDT&data.order_id=platform-demo&data.pay_user_id=987654321&data.status=1&data.unique_id=case-2&id=10001&status=success",
+    "signature": "7442CD41EEF5B542FE7B6AD510C055679003BABF15DCC6667608DA5F06522CEE"
+  },
+  {
+    "params": {
+      "empty": "",
+      "none": null,
+      "zero": 0,
+      "flag": false,
+      "data": {
+        "name": "中文 空格 & =",
+        "amount": "0.000100"
+      }
+    },
+    "base": "data.amount=0.000100&data.name=中文 空格 & =&flag=false&zero=0",
+    "signature": "F617834AB4875A42614AD3C93662E07367B5404ED57D2F52F88572DE2A05D49C"
+  }
+]
