@@ -117,7 +117,7 @@ class Store:
                     if not payload.get('text','').strip(): raise DomainError('文字不能为空')
                     data[key]=[payload]
                 else: data.setdefault(key,[]).append(payload)
-            c.execute('UPDATE drafts SET data=? WHERE id=?',(dump(data),d))
+            c.execute('UPDATE drafts SET data=?,edit_version=edit_version+1 WHERE id=?',(dump(data),d))
     def abandon(self,user,d):
         with self.tx() as c: c.execute("UPDATE drafts SET status='abandoned' WHERE id=? AND user_id=? AND status='editing'",(d,user))
     def submissions(self,r,p):
@@ -128,13 +128,14 @@ class Store:
             if not lines or len(lines)>100: raise DomainError('批量支持1至100行')
             return [{'0':[{'kind':'text','text':line}]} for line in lines]
         return [data]
-    def confirm(self,user,d):
+    def confirm(self,user,d,expected_version=None):
         error=None; batch=None
         with self.tx() as c:
             r=c.execute('SELECT * FROM drafts WHERE id=? AND user_id=?',(d,user)).fetchone()
             if not r: raise DomainError('草稿不存在')
             if r['status']=='submitted': return r['batch_id']
             if r['status']!='editing': raise DomainError('草稿已失效，请重新选商品')
+            if expected_version is not None and r['edit_version']!=expected_version: raise DomainError('草稿已修改，请使用最新预览确认')
             p=self.product(r['product_id'])
             if not p['active'] or p['revision']!=r['revision']: raise DomainError('商品已变更，请重新选择')
             subs=self.submissions(dict(r,data=json.loads(r['data'])),p); total=len(subs)*p['price']
@@ -194,6 +195,14 @@ class Store:
             c.execute('UPDATE receipts SET state=?,message_id=? WHERE id=?',('sent' if delivered else 'staged',message_id if delivered else None,rid))
             if not c.execute("SELECT 1 FROM receipts WHERE order_id=? AND state='sending'",(r['order_id'],)).fetchone(): c.execute("UPDATE orders SET status='delivering' WHERE id=?",(r['order_id'],))
             self.audit(c,actor,'resolve',rid,evidence)
+    def resume(self,actor,o,evidence):
+        self.admin(actor)
+        if not evidence.strip(): raise DomainError('核实证据必填')
+        with self.tx() as c:
+            r=c.execute("SELECT * FROM orders WHERE id=? AND status='uncertain'",(o,)).fetchone()
+            if not r or c.execute("SELECT 1 FROM receipts WHERE order_id=? AND state='sending'",(o,)).fetchone(): raise DomainError('须先逐条核实所有不确定回单')
+            c.execute("UPDATE orders SET status='delivering' WHERE id=?",(o,))
+            self.audit(c,actor,'resume',o,evidence)
     def settle(self,o):
         with self.tx() as c:
             r=c.execute('SELECT * FROM orders WHERE id=?',(o,)).fetchone()
