@@ -20,6 +20,50 @@ class AppTests(Fixture, unittest.TestCase):
         self.app.handle({'message':m})
     def click(self,data,user=1,message_id=90):
         self.app.handle({'callback_query':{'id':'query','from':{'id':user},'data':data,'message':{'chat':{'id':user,'type':'private'},'message_id':message_id}}})
+    def test_home_balance_layout_and_pagination(self):
+        for index in range(1,9):
+            self.s.save_product(99,dict(name=('长名称'*8 if index==2 else f'服务{index}'),price=2,
+                                       description='',eta='',fields=[{'name':'资料','kind':'text'}]))
+        self.msg('/start')
+        card=self.t.calls[-1][1]
+        self.assertIn('💰 可用积分：10',card['text'])
+        self.assertNotIn('冻结',card['text'])
+        self.assertIn('第 1 / 2 页',card['text'])
+        rows=card['reply_markup']['inline_keyboard']
+        goods=[[b for b in row if b.get('callback_data','').startswith('buy:')] for row in rows]
+        goods=[row for row in goods if row]
+        self.assertEqual([2,1,2,2,1],[len(row) for row in goods])
+        self.assertTrue(all(b['style']=='success' for row in goods for b in row))
+        recharge=rows[-1][0]
+        self.assertEqual('充值积分',recharge['text'])
+        self.assertEqual('primary',recharge['style'])
+        self.assertIn('icon_custom_emoji_id',recharge)
+        self.assertNotIn('admin',str(rows))
+        self.click('home:1')
+        method,card=self.t.calls[-1]
+        self.assertEqual('editMessageText',method)
+        self.assertIn('第 2 / 2 页',card['text'])
+        self.assertEqual('home:0',card['reply_markup']['inline_keyboard'][1][0]['callback_data'])
+        last=self.s.products()[-1]
+        last['active']=0
+        self.s.save_product(99,last)
+        self.s.confirm(1,self.draft('one'))
+        self.click('home:1')
+        card=self.t.calls[-1][1]
+        self.assertIn('可用积分：7',card['text'])
+        self.assertIn('冻结积分：3',card['text'])
+        self.assertNotIn('页',card['text'])
+        self.assertNotIn('home:',str(card['reply_markup']))
+    def test_home_empty_catalog_and_admin_entry(self):
+        product=self.s.product(self.p)
+        product['active']=0
+        self.s.save_product(99,product)
+        self.msg('/start')
+        card=self.t.calls[-1][1]
+        self.assertIn('暂无上架服务',card['text'])
+        self.assertEqual(1,len(card['reply_markup']['inline_keyboard']))
+        self.msg('/start',99)
+        self.assertEqual('admin',self.t.calls[-1][1]['reply_markup']['inline_keyboard'][-1][0]['callback_data'])
     def test_customer_draft_edit_and_confirm(self):
         self.msg('/start')
         self.assertNotIn('mine',str(self.t.calls[-1][1]['reply_markup']))

@@ -17,6 +17,7 @@ BUTTON_STYLES = {
 BUTTON_ICONS = {
     # Telegram custom emoji from https://t.me/addemoji/NewsEmoji.
     '充值': ('💵','5409048419211682843'),
+    '充值积分': ('💵','5409048419211682843'),
     '去充值': ('💵','5409048419211682843'),
     '支付订单': ('💸','5233326571099534068'),
     '我的订单': ('🔖','5222444124698853913'),
@@ -103,18 +104,37 @@ class App:
             else: self.message(actor,m)
         except (DomainError,ValueError,KeyError,IndexError) as e:
             self.send(actor,str(e) if isinstance(e,DomainError) else '输入格式不正确，请检查后重试。')
-    def home(self,u):
+    def home(self,u,page=0,message_id=None):
         a,f=self.s.balance(u)
+        products=self.s.products()
+        pages=max(1,(len(products)+7)//8)
+        page=max(0,min(page,pages-1))
         rows=[]
-        for p in self.s.products():
+        for p in products[page*8:(page+1)*8]:
             button=(p['name']+' · '+str(p['price'])+'积分','buy:'+str(p['id']))
             if len(button[0])<=18 and rows and len(rows[-1])==1 and len(rows[-1][0][0])<=18:
                 rows[-1].append(button)
             else:
                 rows.append([button])
-        rows.append([('充值','topup')])
+        if pages>1:
+            nav=[]
+            if page: nav.append(('上一页',f'home:{page-1}'))
+            if page+1<pages: nav.append(('下一页',f'home:{page+1}'))
+            rows.append(nav)
+        rows.append([('充值积分','topup')])
         if u==self.s.admin_id: rows.append([('管理后台','admin')])
-        self.send(u,f'商品列表\n可用 {a} 积分，冻结 {f} 积分\n选择商品后直接发送资料。',rows)
+        lines=['🛍 综合服务','',f'💰 可用积分：{a}']
+        if f: lines.append(f'冻结积分：{f}')
+        lines += ['', '请选择需要的服务' if products else '暂无上架服务']
+        if pages>1: lines.append(f'第 {page+1} / {pages} 页')
+        text='\n'.join(lines)
+        if message_id is not None:
+            try:
+                self.call_with_buttons('editMessageText',rows,chat_id=u,message_id=message_id,text=text)
+                return
+            except TelegramRejected as error:
+                if error.code!=400: raise
+        self.send(u,text,rows)
     def admin_home(self,u):
         self.s.admin(u)
         pending=self.s.one("SELECT COUNT(*) AS n FROM orders WHERE status='pending'")['n']
@@ -130,7 +150,9 @@ class App:
         state=self.s.session(u)
         if action in ('catalog','manage','pending','batch','order','receipts'):
             self.s.set_session(u,{})
-        if action=='home': self.s.set_session(u,{}); self.home(u)
+        if action=='home':
+            self.s.set_session(u,{})
+            self.home(u,int(args[0]) if args else 0,message_id=message_id if args else None)
         elif action=='admin': self.s.set_session(u,{}); self.admin_home(u)
         elif action=='adjust':
             self.s.set_session(u,{'mode':'adjust_user'})
