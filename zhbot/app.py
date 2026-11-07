@@ -105,8 +105,14 @@ class App:
             self.send(actor,str(e) if isinstance(e,DomainError) else '输入格式不正确，请检查后重试。')
     def home(self,u):
         a,f=self.s.balance(u)
-        rows=[[(p['name']+' · '+str(p['price'])+'积分','buy:'+str(p['id']))] for p in self.s.products()]
-        rows += [[('我的订单','mine'),('充值','topup')]]
+        rows=[]
+        for p in self.s.products():
+            button=(p['name']+' · '+str(p['price'])+'积分','buy:'+str(p['id']))
+            if len(button[0])<=18 and rows and len(rows[-1])==1 and len(rows[-1][0][0])<=18:
+                rows[-1].append(button)
+            else:
+                rows.append([button])
+        rows.append([('充值','topup')])
         if u==self.s.admin_id: rows.append([('管理后台','admin')])
         self.send(u,f'商品列表\n可用 {a} 积分，冻结 {f} 积分\n选择商品后直接发送资料。',rows)
     def admin_home(self,u):
@@ -146,7 +152,7 @@ class App:
         elif action=='confirm':
             draft=self.s.draft(u,args[0])
             if draft['status']=='submitted':
-                self.callback(u,'mybatch:'+draft['batch_id'])
+                self.send(u,'已提交，请等待回单。')
                 return
             try: b=self.s.confirm(u,args[0],expected_version=int(args[1]))
             except DomainError:
@@ -161,8 +167,8 @@ class App:
             orders=self.s.orders(b)
             frozen=sum(order['price'] for order in orders)
             available=self.s.balance(u)[0]
-            receipt=f'✅ 已接单，处理中\n已冻结 {frozen} 积分 · 可用 {available} 积分'
-            rows=[[('查看订单','mybatch:'+b)]]
+            receipt=f'✅ 已提交，请等待回单\n已冻结 {frozen} 积分 · 可用 {available} 积分'
+            rows=[]
             if message_id is not None:
                 try:
                     self.call_with_buttons('editMessageText',rows,chat_id=u,message_id=message_id,text=receipt)
@@ -183,7 +189,7 @@ class App:
             if page: nav.append(('上一页',f'mybatch:{args[0]}:{page-1}'))
             if len(orders)>(page+1)*10: nav.append(('下一页',f'mybatch:{args[0]}:{page+1}'))
             if nav: rows.append(nav)
-            rows.append([('我的订单','mine'),('返回首页','home')])
+            rows.append([('返回首页','home')])
             self.send(u,f'{product} · 共 {len(orders)} 单 · 第 {page+1} 页',rows)
         elif action=='mine':
             page=int(args[0]) if args else 0
@@ -214,7 +220,7 @@ class App:
             if o['reason']: lines.append('处理说明：'+o['reason'])
             rows=[]
             if o['status']=='completed': rows.append([('查看回单','myreceipts:'+o['id'])])
-            rows.append([('我的订单','mine'),('返回首页','home')])
+            rows.append([('返回首页','home')])
             self.send(u,'\n'.join(lines),rows)
             for item in attachments: self.send_payload(u,item)
         elif action=='catalog':
@@ -621,14 +627,12 @@ class App:
                 text,rows=self.batch_card(p['batch'],new=True)
             elif e['kind']=='bulk_receipt':
                 text=p['text']
-                rows=[[('查看订单','mybatch:'+p['batch'])]]
             elif e['kind']=='credited': text=f"充值已入账 {p['points']} 积分\n充值订单 {p['payment']}"
             elif e['kind']=='summary':
                 if p['success']==1 and not p['refund']:
                     text=f"✅ 已完成 · 已扣 {p['charged']} 积分"
                 else:
                     text=f"报单已结束\n完成 {p['success']} 单 · 退款 {p['refund']} 单\n已扣 {p['charged']} 积分 · 已退 {p['returned']} 积分"
-                rows=[[('查看订单','mybatch:'+p['batch'])]]
             else:
                 text=f"{order_subject(self.s.order(p['order']))} · 已退 {p['points']} 积分"
                 if p['reason']: text+='\n'+p['reason']
@@ -636,8 +640,8 @@ class App:
                 if not c.execute("UPDATE events SET state='sending' WHERE id=? AND state='pending'",(e['id'],)).rowcount: continue
             try:
                 if e['kind']=='bulk_receipt':
-                    result=self.call_with_buttons('sendMessage',rows,chat_id=e['target'],text=text,
-                                                  link_preview_options={'is_disabled':True})
+                    result=self.t.call('sendMessage',chat_id=e['target'],text=text,
+                                       link_preview_options={'is_disabled':True})
                 else:
                     result=self.send(e['target'],text,rows)
                 with self.s.tx() as c:

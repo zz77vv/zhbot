@@ -21,6 +21,9 @@ class AppTests(Fixture, unittest.TestCase):
     def click(self,data,user=1,message_id=90):
         self.app.handle({'callback_query':{'id':'query','from':{'id':user},'data':data,'message':{'chat':{'id':user,'type':'private'},'message_id':message_id}}})
     def test_customer_draft_edit_and_confirm(self):
+        self.msg('/start')
+        self.assertNotIn('mine',str(self.t.calls[-1][1]['reply_markup']))
+        self.t.calls.clear()
         self.click('buy:'+str(self.p))
         cards=[data for method,data in self.t.calls if method=='sendMessage']
         self.assertEqual(1,len(cards))
@@ -32,11 +35,11 @@ class AppTests(Fixture, unittest.TestCase):
         method,receipt=self.t.calls[-1]
         self.assertEqual('editMessageText',method)
         self.assertIn('已冻结 6 积分 · 可用 4 积分',receipt['text'])
-        view=receipt['reply_markup']['inline_keyboard'][0][0]['callback_data']
-        self.click(view,2)
-        self.assertIn('找不到这笔订单',self.t.calls[-1][1]['text'])
-        self.click(view)
-        self.assertIn('处理中',str(self.t.calls[-1][1]))
+        self.assertEqual([],receipt['reply_markup']['inline_keyboard'])
+        self.assertIn('等待回单',receipt['text'])
+        self.click('confirm:'+d+':'+str(self.s.draft(1,d)['edit_version']))
+        self.assertEqual(2,len(self.s.orders()))
+        self.assertIn('等待回单',self.t.calls[-1][1]['text'])
         self.app.flush_events()
         self.assertEqual(1,len([x for x in self.t.calls if '新批次' in x[1].get('text','')]))
     def test_button_icons_fall_back_after_definite_rejection(self):
@@ -171,6 +174,8 @@ class AppTests(Fixture, unittest.TestCase):
         messages=[d['text'] for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1]
         self.assertEqual(1,len(messages))
         self.assertIn('abc 查询结果\ndef 空',messages[0])
+        customer_calls=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1]
+        self.assertNotIn('reply_markup',customer_calls[0])
         self.assertEqual(['completed','empty'],[o['status'] for o in self.s.orders(batch)])
         self.assertEqual((7,0),self.s.balance(1))
     def test_bulk_timeout_keeps_balance_until_delivery_is_verified(self):
