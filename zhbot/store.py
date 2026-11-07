@@ -10,6 +10,12 @@ from pathlib import Path
 class DomainError(ValueError):
     pass
 
+
+class InsufficientPoints(DomainError):
+    def __init__(self,missing):
+        self.missing=missing
+        super().__init__(f'还差 {missing} 积分，资料已保留。')
+
 def uid():
     return uuid.uuid4().hex[:16]
 
@@ -158,8 +164,8 @@ class Store:
             subs=self.submissions(dict(r,data=json.loads(r['data'])),p); total=len(subs)*p['price']
             available=self.balance(user)[0]
             if available<total:
-                c.execute("UPDATE drafts SET status='rejected' WHERE id=?",(d,))
-                error=f'整批拒绝：需要 {total}，现有 {available}，差额 {total-available} 积分。请充值后重新选商品报单。'
+                c.execute('UPDATE drafts SET edit_version=edit_version+1 WHERE id=?',(d,))
+                error=InsufficientPoints(total-available)
             else:
                 batch=uid(); c.execute('INSERT INTO batches(id,user_id) VALUES(?,?)',(batch,user))
                 for sub in subs:
@@ -167,7 +173,7 @@ class Store:
                     self.money(c,user,-p['price'],p['price'],'freeze:'+o,'订单冻结')
                 c.execute("UPDATE drafts SET status='submitted',batch_id=? WHERE id=?",(batch,d))
                 self.event(c,'new:'+batch,'new',self.admin_id,{'batch':batch})
-        if error: raise DomainError(error)
+        if error: raise error
         return batch
     def orders(self,batch=None):
         return self.rows('SELECT * FROM orders'+(' WHERE batch_id=?' if batch else '')+' ORDER BY rowid',(batch,) if batch else ())
@@ -249,11 +255,16 @@ class Store:
         with self.tx() as c:
             self.require_pending(c,o)
             c.execute('DELETE FROM receipts WHERE id=? AND order_id=?',(rid,o)); self.audit(c,actor,'receipt_delete',o,str(rid))
-    def begin_delivery(self,actor,o):
+    def begin_delivery(self,actor,o,expected_receipts=None):
         self.admin(actor)
         with self.tx() as c:
             self.require_pending(c,o)
-            if not c.execute('SELECT 1 FROM receipts WHERE order_id=?',(o,)).fetchone(): raise DomainError('无回单，使用空单退分')
+            receipts=[dict(r) for r in c.execute('SELECT id,payload,state FROM receipts WHERE order_id=? ORDER BY id',(o,))]
+            if not receipts: raise DomainError('还没有回单，请先添加；无结果请用空单退分。')
+            if expected_receipts is not None and receipts!=expected_receipts:
+                raise DomainError('回单已修改，请重新预览后发送。')
+            if any(r['state']!='staged' for r in receipts):
+                raise DomainError('回单状态已改变，请核实后再处理。')
             c.execute("UPDATE orders SET status='delivering' WHERE id=?",(o,)); self.audit(c,actor,'deliver',o)
     def mark_sending(self,rid):
         with self.tx() as c:

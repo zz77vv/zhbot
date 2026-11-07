@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from zhbot.store import Store, DomainError
+from zhbot.store import Store, DomainError, InsufficientPoints
 
 class Fixture:
     def setUp(self):
@@ -23,12 +23,33 @@ class DomainTests(Fixture, unittest.TestCase):
         self.assertEqual((4,6),self.s.balance(1))
         self.assertEqual(2,len(self.s.orders(b)))
         self.assertEqual(1,len(self.s.events()))
-    def test_insufficient_rejects_whole_batch_and_invalidates(self):
+    def test_insufficient_preserves_whole_batch_for_reconfirmation_after_credit(self):
         d=self.draft('a\nb\nc\nd')
-        with self.assertRaises(DomainError): self.s.confirm(1,d)
+        before=self.s.draft(1,d)
+        ledger_before=self.s.rows('SELECT * FROM ledger')
+        with self.assertRaises(InsufficientPoints) as caught:
+            self.s.confirm(1,d,expected_version=before['edit_version'])
+        self.assertEqual(2,caught.exception.missing)
         self.assertEqual((10,0),self.s.balance(1))
         self.assertEqual([],self.s.orders())
-        with self.assertRaises(DomainError): self.s.confirm(1,d)
+        self.assertEqual([],self.s.rows('SELECT * FROM batches'))
+        self.assertEqual([],self.s.events())
+        self.assertEqual(ledger_before,self.s.rows('SELECT * FROM ledger'))
+        retained=self.s.draft(1,d)
+        self.assertEqual('editing',retained['status'])
+        self.assertEqual(before['data'],retained['data'])
+        self.assertEqual(before['edit_version']+1,retained['edit_version'])
+        self.s.adjust(99,1,2,'补足报单积分','topup')
+        with self.assertRaises(DomainError):
+            self.s.confirm(1,d,expected_version=before['edit_version'])
+        self.assertEqual((12,0),self.s.balance(1))
+        self.assertEqual([],self.s.orders())
+        batch=self.s.confirm(1,d,expected_version=retained['edit_version'])
+        self.assertEqual(4,len(self.s.orders(batch)))
+        self.assertEqual((0,12),self.s.balance(1))
+        self.assertEqual(batch,self.s.confirm(1,d,expected_version=retained['edit_version']))
+        self.assertEqual(4,len(self.s.orders()))
+        self.assertEqual(4,len([row for row in self.s.rows('SELECT * FROM ledger') if row['event_key'].startswith('freeze:')]))
     def test_receipts_staged_then_settled_and_summary(self):
         b=self.s.confirm(1,self.draft()); a,c=self.s.orders(b)
         self.s.add_receipt(99,a['id'],{'kind':'text','text':'done'})

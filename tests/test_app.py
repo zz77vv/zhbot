@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 from test_domain import Fixture
-from zhbot.app import App
+from zhbot.app import App, UI_ICONS, THEME_ALT
 from zhbot.telegram import TelegramRejected
 
 class Telegram:
@@ -26,16 +26,16 @@ class AppTests(Fixture, unittest.TestCase):
         encoded=request['text'].encode('utf-16-le')
         for entity in entities:
             self.assertEqual('custom_emoji',entity['type'])
-            self.assertEqual(emoji,encoded[entity['offset']*2:(entity['offset']+entity['length'])*2].decode('utf-16-le'))
+            self.assertEqual(THEME_ALT,encoded[entity['offset']*2:(entity['offset']+entity['length'])*2].decode('utf-16-le'))
     def test_home_balance_layout_and_pagination(self):
         for index in range(1,9):
             self.s.save_product(99,dict(name=('长名称'*8 if index==2 else f'服务{index}'),price=2,
                                        description='',eta='',fields=[{'name':'资料','kind':'text'}]))
         self.msg('/start')
         card=self.t.calls[-1][1]
-        self.assertIn('💵 可用积分：10',card['text'])
+        self.assertIn('可用积分：10',card['text'])
         encoded=card['text'].encode('utf-16-le')
-        self.assertEqual(['🛍','💵'],[encoded[e['offset']*2:(e['offset']+e['length'])*2].decode('utf-16-le') for e in card['entities']])
+        self.assertEqual([THEME_ALT,THEME_ALT],[encoded[e['offset']*2:(e['offset']+e['length'])*2].decode('utf-16-le') for e in card['entities']])
         self.assertNotIn('冻结',card['text'])
         self.assertIn('第 1 / 2 页',card['text'])
         rows=card['reply_markup']['inline_keyboard']
@@ -84,7 +84,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.assertEqual(2,len(first['entities']))
         self.assertEqual([],retry['entities'])
         self.assertEqual([],later['entities'])
-        self.assertEqual(first['text'],retry['text'])
+        self.assertEqual(first['text'].replace(THEME_ALT,''),retry['text'].replace('🛍','').replace('💵',''))
         self.assertNotIn('icon_custom_emoji_id',retry['reply_markup']['inline_keyboard'][-1][0])
         self.app.custom_emoji=True
         with patch.object(self.t,'call',side_effect=TimeoutError()) as call:
@@ -113,7 +113,7 @@ class AppTests(Fixture, unittest.TestCase):
         cards=[data for method,data in self.t.calls if method=='sendMessage']
         self.assertEqual(1,len(cards))
         self.assertIn('批量报单每行一个',cards[0]['text'])
-        self.assert_custom_icon(cards[0],'🛍','5229064374403998351')
+        self.assert_custom_icon(cards[0],'🛍',UI_ICONS['🛍'])
         self.msg('first'); self.msg('a\nb')
         self.assertIn('共 2 单，需 6 积分',self.t.calls[-1][1]['text'])
         d=self.s.session(1)['draft']; self.click('confirm:'+d+':'+str(self.s.draft(1,d)['edit_version']))
@@ -123,7 +123,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.assertIn('已冻结 6 积分 · 可用 4 积分',receipt['text'])
         self.assertEqual([],receipt['reply_markup']['inline_keyboard'])
         self.assertIn('等待回单',receipt['text'])
-        self.assert_custom_icon(receipt,'✔️','5206607081334906820')
+        self.assert_custom_icon(receipt,'✔️',UI_ICONS['✔️'])
         self.click('confirm:'+d+':'+str(self.s.draft(1,d)['edit_version']))
         self.assertEqual(2,len(self.s.orders()))
         self.assertIn('等待回单',self.t.calls[-1][1]['text'])
@@ -137,7 +137,7 @@ class AppTests(Fixture, unittest.TestCase):
         first,retry,next_send=[
             request.kwargs['reply_markup']['inline_keyboard'][0] for request in call.call_args_list
         ]
-        self.assertEqual('5206607081334906820',first[0]['icon_custom_emoji_id'])
+        self.assertEqual(UI_ICONS['✔️'],first[0]['icon_custom_emoji_id'])
         self.assertEqual('success',first[0]['style'])
         self.assertEqual(['danger','primary','success'],[button['style'] for button in first[1:]])
         self.assertEqual('✔️ 确认发送',retry[0]['text'])
@@ -149,14 +149,21 @@ class AppTests(Fixture, unittest.TestCase):
             self.app.send(1,'✔️ 已完成')
             self.app.send(1,'✔️ 已完成')
         first,retry,later=[request.kwargs for request in call.call_args_list]
-        self.assert_custom_icon(first,'✔️','5206607081334906820')
+        self.assert_custom_icon(first,'✔️',UI_ICONS['✔️'])
         self.assertFalse(any(e['type']=='custom_emoji' for e in retry.get('entities',[])))
         self.assertFalse(any(e['type']=='custom_emoji' for e in later.get('entities',[])))
-        self.assertEqual(first['text'],retry['text'])
+        self.assertEqual(first['text'].replace(THEME_ALT,''),retry['text'].replace('✔️',''))
         self.app.custom_emoji=True
         with patch.object(self.t,'call',side_effect=TimeoutError()) as call:
             with self.assertRaises(TimeoutError): self.app.send(1,'✔️ 已完成')
         self.assertEqual(1,call.call_count)
+    def test_unchanged_plain_fallback_keeps_existing_card_without_resending(self):
+        with patch.object(self.t,'call',side_effect=[TelegramRejected(400,reason='custom_emoji'),
+                                                   TelegramRejected(400,reason='not_modified')]) as call:
+            result=self.app.card(1,'💵 充值已入账 2 积分',message_id=123)
+        self.assertEqual({'message_id':123},result)
+        self.assertEqual(['editMessageText','editMessageText'],[request.args[0] for request in call.call_args_list])
+        self.assertFalse(self.app.custom_emoji)
     def test_admin_reply_staged_and_delivery(self):
         o=self.s.orders(self.s.confirm(1,self.draft('one')))[0]['id']
         self.click('order:'+o,99)
@@ -165,7 +172,12 @@ class AppTests(Fixture, unittest.TestCase):
         raw='🛍 原始回单 ✔️ 💵'
         self.msg(raw,99,reply=link)
         self.assertEqual(1,len(self.s.receipts(o))); self.assertEqual('pending',self.s.order(o)['status'])
-        self.click('finish:'+o,99); self.app.deliver()
+        self.click('finish:'+o,99)
+        self.assertEqual('pending',self.s.order(o)['status'])
+        preview=[data for method,data in self.t.calls if method=='sendMessage' and data.get('chat_id')==99 and data.get('text')==raw]
+        self.assertEqual(1,len(preview))
+        self.assertNotIn('entities',preview[0])
+        self.click('sendreceipt:'+self.s.session(99)['key'],99); self.app.deliver()
         self.assertEqual('completed',self.s.order(o)['status'])
         delivered=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1 and d.get('text')==raw]
         self.assertEqual(1,len(delivered))
@@ -173,7 +185,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.app.flush_events()
         summary=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1 and '已完成 · 已扣' in d.get('text','')]
         self.assertEqual(1,len(summary))
-        self.assert_custom_icon(summary[0],'✔️','5206607081334906820')
+        self.assert_custom_icon(summary[0],'✔️',UI_ICONS['✔️'])
     def test_group_and_forged_admin_rejected(self):
         self.msg('/admin',1); self.msg('/start',chat_type='group')
         self.click('manage:'+str(self.p),1)
@@ -258,7 +270,8 @@ class AppTests(Fixture, unittest.TestCase):
             self.app.handle({'message':{'chat':{'id':99,'type':'private'},'from':{'id':99},'reply_to_message':{'message_id':link},**media}})
         self.assertEqual(3,len(self.s.receipts(o)))
         self.assertFalse(any(d.get('chat_id')==1 and method in ('sendPhoto','sendDocument') for method,d in self.t.calls))
-        self.click('finish:'+o,99); self.app.deliver()
+        self.click('finish:'+o,99)
+        self.click('sendreceipt:'+self.s.session(99)['key'],99); self.app.deliver()
         self.assertEqual('completed',self.s.order(o)['status'])
         self.assertEqual((7,0),self.s.balance(1))
     def test_bulk_delivery_validates_accounts_and_settles_once(self):
@@ -285,7 +298,7 @@ class AppTests(Fixture, unittest.TestCase):
         customer_calls=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1]
         self.assertEqual([],customer_calls[0]['reply_markup']['inline_keyboard'])
         self.assertEqual(1,len(customer_calls[0]['entities']))
-        self.assert_custom_icon(customer_calls[0],'✉️','5253742260054409879')
+        self.assert_custom_icon(customer_calls[0],'✉️',UI_ICONS['✉️'])
         self.assertEqual(['completed','empty'],[o['status'] for o in self.s.orders(batch)])
         self.assertEqual((7,0),self.s.balance(1))
     def test_bulk_timeout_keeps_balance_until_delivery_is_verified(self):
