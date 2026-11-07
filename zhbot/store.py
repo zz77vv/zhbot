@@ -204,7 +204,7 @@ class Store:
             charged=sum(o['price'] for account,o in orders.items() if results[account]!='空')
             returned=sum(o['price'] for account,o in orders.items() if results[account]=='空')
             lines='\n'.join(f'{account} {results[account]}' for account in orders)
-            text=f'📋 回单结果\n\n{lines}\n\n扣费 {charged} 积分 · 退回 {returned} 积分'
+            text=f'✉️ 回单结果\n\n{lines}\n\n扣费 {charged} 积分 · 退回 {returned} 积分'
             if len(text.encode('utf-16-le'))//2>4000:
                 raise DomainError('回单太长，请缩短结果或逐单处理。')
             first=next(iter(orders.values()))

@@ -7,10 +7,11 @@ class TelegramError(RuntimeError):
     pass
 
 class TelegramRejected(TelegramError):
-    def __init__(self, code, retry_after=None):
+    def __init__(self, code, retry_after=None, reason=None):
         super().__init__('Telegram 明确拒绝请求')
         self.code = code
         self.retry_after = retry_after
+        self.reason = reason
 
     @classmethod
     def from_response(cls, result):
@@ -23,7 +24,15 @@ class TelegramRejected(TelegramError):
         delay = params.get('retry_after') if isinstance(params, dict) else None
         if code == 429:
             delay = delay if type(delay) is int and 0 < delay <= 86400 else 60
-        return cls(code, delay if code == 429 else None)
+        description = result.get('description')
+        description = description.lower().replace('_', ' ') if isinstance(description, str) else ''
+        reason = None
+        if code == 400:
+            if 'message is not modified' in description:
+                reason = 'not_modified'
+            elif 'custom emoji' in description or 'button icon' in description:
+                reason = 'custom_emoji'
+        return cls(code, delay if code == 429 else None, reason)
 
 class Telegram:
     def __init__(self,token):

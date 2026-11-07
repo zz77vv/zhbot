@@ -26,7 +26,19 @@ BUTTON_ICONS = {
     '确认发送': ('✔️','5206607081334906820'),
     '批量回单': ('✉️','5253742260054409879'),
 }
-HOME_ICONS = {'🛍':'5229064374403998351','💵':'5409048419211682843'}
+UI_ICONS = {'🛍':'5229064374403998351','💵':'5409048419211682843',
+            '✔️':'5206607081334906820','✉️':'5253742260054409879'}
+
+
+def ui_entities(text):
+    entities=[]
+    for emoji,emoji_id in UI_ICONS.items():
+        start=0
+        while (index:=text.find(emoji,start))!=-1:
+            entities.append({'type':'custom_emoji','offset':len(text[:index].encode('utf-16-le'))//2,
+                             'length':len(emoji.encode('utf-16-le'))//2,'custom_emoji_id':emoji_id})
+            start=index+len(emoji)
+    return sorted(entities,key=lambda entity:entity['offset'])
 
 
 def keyboard(rows, custom_emoji=True):
@@ -70,12 +82,17 @@ class App:
         self.s,self.t,self.payments=store,telegram,payments
         self.custom_emoji=True
     def call_with_buttons(self,method,rows,**data):
+        if 'entities' not in data:
+            entities=ui_entities(data.get('text',''))
+            if entities: data['entities']=entities
         if not self.custom_emoji and 'entities' in data:
             data['entities']=[e for e in data['entities'] if e['type']!='custom_emoji']
         markup=keyboard(rows,self.custom_emoji)
         try:
             return self.t.call(method,reply_markup=markup,**data)
         except TelegramRejected as error:
+            if method=='editMessageText' and error.reason=='not_modified':
+                return {'message_id':data['message_id']}
             has_custom=any(
                 'icon_custom_emoji_id' in button for row in markup['inline_keyboard'] for button in row
             ) or any(e['type']=='custom_emoji' for e in data.get('entities',[]))
@@ -84,14 +101,14 @@ class App:
             if 'entities' in data:
                 data['entities']=[e for e in data['entities'] if e['type']!='custom_emoji']
             result=self.t.call(method,reply_markup=keyboard(rows,custom_emoji=False),**data)
-            self.custom_emoji=False
+            if error.reason=='custom_emoji': self.custom_emoji=False
             return result
     def send(self,user,text,rows=None):
         chunks=[str(text)[i:i+2000] for i in range(0,len(str(text)),2000)] or ['（空）']
         for index,chunk in enumerate(chunks):
             args={'chat_id':user,'text':chunk,'link_preview_options':{'is_disabled':True}}
-            if rows and index==len(chunks)-1:
-                result=self.call_with_buttons('sendMessage',rows,**args)
+            if (rows and index==len(chunks)-1) or ui_entities(chunk):
+                result=self.call_with_buttons('sendMessage',rows if index==len(chunks)-1 and rows else [],**args)
             else:
                 result=self.t.call('sendMessage',**args)
         return result
@@ -134,9 +151,7 @@ class App:
         lines += ['', '请选择需要的服务' if products else '暂无上架服务']
         if pages>1: lines.append(f'第 {page+1} / {pages} 页')
         text='\n'.join(lines)
-        entities=[{'type':'custom_emoji','offset':len(text[:text.index(emoji)].encode('utf-16-le'))//2,
-                   'length':len(emoji.encode('utf-16-le'))//2,'custom_emoji_id':emoji_id}
-                  for emoji,emoji_id in HOME_ICONS.items()]
+        entities=ui_entities(text)
         if message_id is not None:
             try:
                 self.call_with_buttons('editMessageText',rows,chat_id=u,message_id=message_id,text=text,entities=entities)
@@ -199,7 +214,7 @@ class App:
             orders=self.s.orders(b)
             frozen=sum(order['price'] for order in orders)
             available=self.s.balance(u)[0]
-            receipt=f'✅ 已提交，请等待回单\n已冻结 {frozen} 积分 · 可用 {available} 积分'
+            receipt=f'✔️ 已提交，请等待回单\n已冻结 {frozen} 积分 · 可用 {available} 积分'
             rows=[]
             if message_id is not None:
                 try:
@@ -659,10 +674,12 @@ class App:
                 text,rows=self.batch_card(p['batch'],new=True)
             elif e['kind']=='bulk_receipt':
                 text=p['text']
+                if text.startswith('📋 回单结果'):
+                    text='✉️'+text[1:]
             elif e['kind']=='credited': text=f"充值已入账 {p['points']} 积分\n充值订单 {p['payment']}"
             elif e['kind']=='summary':
                 if p['success']==1 and not p['refund']:
-                    text=f"✅ 已完成 · 已扣 {p['charged']} 积分"
+                    text=f"✔️ 已完成 · 已扣 {p['charged']} 积分"
                 else:
                     text=f"报单已结束\n完成 {p['success']} 单 · 退款 {p['refund']} 单\n已扣 {p['charged']} 积分 · 已退 {p['returned']} 积分"
             else:
@@ -672,8 +689,9 @@ class App:
                 if not c.execute("UPDATE events SET state='sending' WHERE id=? AND state='pending'",(e['id'],)).rowcount: continue
             try:
                 if e['kind']=='bulk_receipt':
-                    result=self.t.call('sendMessage',chat_id=e['target'],text=text,
-                                       link_preview_options={'is_disabled':True})
+                    result=self.call_with_buttons('sendMessage',[],chat_id=e['target'],text=text,
+                                                  entities=ui_entities(text.split('\n',1)[0]),
+                                                  link_preview_options={'is_disabled':True})
                 else:
                     result=self.send(e['target'],text,rows)
                 with self.s.tx() as c:
