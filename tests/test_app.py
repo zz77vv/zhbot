@@ -1,7 +1,9 @@
 import json
 import unittest
+from unittest.mock import patch
 from test_domain import Fixture
 from zhbot.app import App
+from zhbot.telegram import TelegramRejected
 
 class Telegram:
     def __init__(self): self.calls=[]; self.fail=False
@@ -16,14 +18,42 @@ class AppTests(Fixture, unittest.TestCase):
         m={'chat':{'id':user,'type':chat_type},'from':{'id':user},'message_id':88,'text':text}
         if reply: m['reply_to_message']={'message_id':reply}
         self.app.handle({'message':m})
-    def click(self,data,user=1):
-        self.app.handle({'callback_query':{'id':'query','from':{'id':user},'data':data,'message':{'chat':{'id':user,'type':'private'}}}})
+    def click(self,data,user=1,message_id=90):
+        self.app.handle({'callback_query':{'id':'query','from':{'id':user},'data':data,'message':{'chat':{'id':user,'type':'private'},'message_id':message_id}}})
     def test_customer_draft_edit_and_confirm(self):
-        self.click('buy:'+str(self.p)); self.msg('first'); self.msg('a\nb')
+        self.click('buy:'+str(self.p))
+        cards=[data for method,data in self.t.calls if method=='sendMessage']
+        self.assertEqual(1,len(cards))
+        self.assertIn('批量报单每行一个',cards[0]['text'])
+        self.msg('first'); self.msg('a\nb')
+        self.assertIn('共 2 单，需 6 积分',self.t.calls[-1][1]['text'])
         d=self.s.session(1)['draft']; self.click('confirm:'+d+':'+str(self.s.draft(1,d)['edit_version']))
         self.assertEqual(2,len(self.s.orders())); self.assertEqual((4,6),self.s.balance(1))
+        method,receipt=self.t.calls[-1]
+        self.assertEqual('editMessageText',method)
+        self.assertIn('已冻结 6 积分 · 可用 4 积分',receipt['text'])
+        view=receipt['reply_markup']['inline_keyboard'][0][0]['callback_data']
+        self.click(view,2)
+        self.assertIn('找不到这笔订单',self.t.calls[-1][1]['text'])
+        self.click(view)
+        self.assertIn('处理中',str(self.t.calls[-1][1]))
         self.app.flush_events()
         self.assertEqual(1,len([x for x in self.t.calls if '新批次' in x[1].get('text','')]))
+    def test_button_icons_fall_back_after_definite_rejection(self):
+        rows=[[('确认发送','bulkyes:key'),('取消','admin'),('返回','home'),('商品','buy:1')]]
+        with patch.object(self.t,'call',side_effect=[TelegramRejected(400),{'message_id':1},{'message_id':2}]) as call:
+            self.app.send(99,'回单预览',rows)
+            self.app.send(99,'回单预览',rows)
+        first,retry,next_send=[
+            request.kwargs['reply_markup']['inline_keyboard'][0] for request in call.call_args_list
+        ]
+        self.assertEqual('5206607081334906820',first[0]['icon_custom_emoji_id'])
+        self.assertEqual('success',first[0]['style'])
+        self.assertEqual(['danger','primary','success'],[button['style'] for button in first[1:]])
+        self.assertEqual('✔️ 确认发送',retry[0]['text'])
+        self.assertEqual('success',retry[0]['style'])
+        self.assertNotIn('icon_custom_emoji_id',retry[0])
+        self.assertEqual(retry,next_send)
     def test_admin_reply_staged_and_delivery(self):
         o=self.s.orders(self.s.confirm(1,self.draft('one')))[0]['id']
         self.click('order:'+o,99)
@@ -46,8 +76,55 @@ class AppTests(Fixture, unittest.TestCase):
         self.click('newproduct',99)
         for value in ['新商品','2','说明','一天','客户资料:text']: self.msg(value,99)
         self.assertEqual(1,len(self.s.products()))
-        self.click('saveproduct',99)
+        self.click('saveproduct:'+self.s.session(99)['key'],99)
         self.assertEqual(2,len(self.s.products()))
+    def test_admin_home_is_compact_and_adjustment_is_guided(self):
+        self.msg('/admin',99)
+        home=self.t.calls[-1][1]
+        self.assertNotIn('/adjust',home['text'])
+        self.assertIn('积分管理',str(home))
+        self.click('adjust',99)
+        self.msg('1',99); self.msg('5',99); self.msg('测试加分',99)
+        key=self.s.session(99)['key']
+        self.assertEqual((10,0),self.s.balance(1))
+        self.click('adjustyes:'+key,99)
+        self.assertEqual((15,0),self.s.balance(1))
+    def test_product_field_buttons_and_stale_save(self):
+        self.click('newproduct',99)
+        for value in ('商品甲','2','说明','2 小时','抖音号'): self.msg(value,99)
+        key=self.s.session(99)['key']
+        self.click('pfieldkind:'+key+':text',99)
+        key=self.s.session(99)['key']
+        self.click('pfieldsdone:'+key,99)
+        old_key=self.s.session(99)['key']
+        self.click('newproduct',99)
+        for value in ('商品乙','3','说明','1 小时','账号:text'): self.msg(value,99)
+        new_key=self.s.session(99)['key']
+        self.click('saveproduct:'+old_key,99)
+        self.assertEqual(1,len(self.s.products()))
+        self.click('saveproduct:'+new_key,99)
+        saved=self.s.products()[-1]
+        self.assertEqual('商品乙',saved['name'])
+        self.assertEqual([{'name':'账号','kind':'text'}],saved['fields'])
+    def test_customer_order_details_and_receipts_are_owner_scoped(self):
+        batch=self.s.confirm(1,self.draft('account'))
+        order=self.s.orders(batch)[0]['id']
+        self.click('mine')
+        self.assertIn('mineorder:'+order,str(self.t.calls[-1][1]))
+        self.click('mineorder:'+order,2)
+        self.assertNotIn('account',self.t.calls[-1][1]['text'])
+        self.s.add_receipt(99,order,{'kind':'text','text':'private-result'})
+        self.click('myreceipts:'+order)
+        self.assertNotIn('private-result',str(self.t.calls[-1]))
+        self.s.begin_delivery(99,order)
+        self.app.deliver()
+        self.t.calls.clear()
+        self.click('myreceipts:'+order,2)
+        self.assertNotIn('private-result',str(self.t.calls))
+        self.click('mineorder:'+order)
+        self.assertIn('已完成',self.t.calls[-1][1]['text'])
+        self.click('myreceipts:'+order)
+        self.assertIn('private-result',str(self.t.calls))
     def test_cancel_revokes_adjustment_confirmation(self):
         self.msg('/adjust 1 5 补款',99)
         key=self.s.session(99)['key']; self.click('admin',99); self.click('adjustyes:'+key,99)
@@ -73,6 +150,44 @@ class AppTests(Fixture, unittest.TestCase):
         self.click('finish:'+o,99); self.app.deliver()
         self.assertEqual('completed',self.s.order(o)['status'])
         self.assertEqual((7,0),self.s.balance(1))
+    def test_bulk_delivery_validates_accounts_and_settles_once(self):
+        batch=self.s.confirm(1,self.draft('abc\ndef'))
+        self.app.flush_events()
+        notification=self.t.calls[-1][1]
+        self.assertIn('1. abc · 处理中',notification['text'])
+        self.assertNotIn(batch,notification['text'])
+        self.click('bulk:'+batch,99)
+        self.msg('abc 查询结果\nabc 空',99)
+        self.assertIn('第 2 行的账号重复了',self.t.calls[-1][1]['text'])
+        self.msg('def 空\nabc 查询结果',99)
+        key=self.s.session(99)['key']
+        self.click('bulkyes:'+key,99)
+        self.click('bulkyes:'+key,99)
+        self.assertEqual((4,6),self.s.balance(1))
+        self.app.deliver()
+        self.assertEqual((4,6),self.s.balance(1))
+        self.app.flush_events()
+        self.app.flush_events()
+        messages=[d['text'] for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1]
+        self.assertEqual(1,len(messages))
+        self.assertIn('abc 查询结果\ndef 空',messages[0])
+        self.assertEqual(['completed','empty'],[o['status'] for o in self.s.orders(batch)])
+        self.assertEqual((7,0),self.s.balance(1))
+    def test_bulk_timeout_keeps_balance_until_delivery_is_verified(self):
+        batch=self.s.confirm(1,self.draft('abc\ndef'))
+        self.app.flush_events()
+        self.s.queue_bulk(99,batch,{'abc':'查询结果','def':'空'})
+        self.t.fail=True
+        self.app.flush_events()
+        self.assertEqual((4,6),self.s.balance(1))
+        event=self.s.events()[-1]
+        self.assertEqual('uncertain',event['state'])
+        self.t.fail=False
+        self.app.flush_events()
+        self.assertEqual((4,6),self.s.balance(1))
+        self.msg(f"/event {event['id']} sent 123",99)
+        self.assertEqual((7,0),self.s.balance(1))
+        self.assertEqual('sent',self.s.events()[-1]['state'])
     def test_admin_can_order_as_customer(self):
         self.s.adjust(99,99,5,'测试','admin-seed')
         self.click('buy:'+str(self.p),99); self.msg('管理员的报单',99)

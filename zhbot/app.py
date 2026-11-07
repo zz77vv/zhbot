@@ -1,10 +1,54 @@
 """Private-chat Telegram UI; domain authorization is also enforced in Store."""
 import json
+from .payments import PaymentCreationUncertain
 from .store import DomainError, uid
+from .telegram import TelegramRejected
 
 
-def keyboard(rows):
-    return {'inline_keyboard':[[{'text':label,'callback_data':data} for label,data in row] for row in rows]}
+FIELD_TYPES = {'text':'文字','photo':'图片','document':'文件'}
+ORDER_STATES = {
+    'pending':'处理中', 'delivering':'发送回单中', 'bulk_delivering':'发送回单中', 'uncertain':'待核实',
+    'completed':'已完成', 'empty':'已退款', 'cancel':'已退款',
+}
+BUTTON_STYLES = {
+    **dict.fromkeys(('确认提交','确认发送','完成订单','确认保存','确认保存并上架','确认调整','支付订单'), 'success'),
+    **dict.fromkeys(('取消','管理员取消','空单退分','确认退款','删除','放弃'), 'danger'),
+}
+BUTTON_ICONS = {
+    # Telegram custom emoji from https://t.me/addemoji/NewsEmoji.
+    '充值': ('💵','5409048419211682843'),
+    '去充值': ('💵','5409048419211682843'),
+    '支付订单': ('💸','5233326571099534068'),
+    '我的订单': ('🔖','5222444124698853913'),
+    '查看订单': ('🔍','5231012545799666522'),
+    '确认提交': ('✔️','5206607081334906820'),
+    '确认发送': ('✔️','5206607081334906820'),
+    '批量回单': ('✉️','5253742260054409879'),
+}
+
+
+def keyboard(rows, custom_emoji=True):
+    rendered=[]
+    for row in rows:
+        buttons=[]
+        for item in row:
+            if isinstance(item,dict):
+                button=dict(item)
+            else:
+                label,data=item
+                button={'text':label,'callback_data':data}
+            label=button['text']
+            is_product=button.get('callback_data','').startswith('buy:')
+            button['style']='success' if is_product else BUTTON_STYLES.get(label,'primary')
+            icon=BUTTON_ICONS.get(label)
+            if icon:
+                if custom_emoji:
+                    button['icon_custom_emoji_id']=icon[1]
+                else:
+                    button['text']=f'{icon[0]} {label}'
+            buttons.append(button)
+        rendered.append(buttons)
+    return {'inline_keyboard':rendered}
 
 def payload(m):
     if m.get('photo'): return {'kind':'photo','file_id':m['photo'][-1]['file_id'],'caption':m.get('caption','')}
@@ -12,15 +56,37 @@ def payload(m):
     if m.get('text'): return {'kind':'text','text':m['text']}
     raise DomainError('仅支持文字、图片和文件')
 
+def order_subject(order):
+    for items in json.loads(order['submission']).values():
+        for item in items:
+            if item['kind']=='text':
+                return ' '.join(item['text'].split())[:36]
+    return '附件资料'
+
 class App:
     def __init__(self,store,telegram,payments=None):
         self.s,self.t,self.payments=store,telegram,payments
+        self.custom_emoji=True
+    def call_with_buttons(self,method,rows,**data):
+        markup=keyboard(rows,self.custom_emoji)
+        try:
+            return self.t.call(method,reply_markup=markup,**data)
+        except TelegramRejected as error:
+            if error.code!=400 or not any(
+                'icon_custom_emoji_id' in button for row in markup['inline_keyboard'] for button in row
+            ):
+                raise
+            result=self.t.call(method,reply_markup=keyboard(rows,custom_emoji=False),**data)
+            self.custom_emoji=False
+            return result
     def send(self,user,text,rows=None):
         chunks=[str(text)[i:i+2000] for i in range(0,len(str(text)),2000)] or ['（空）']
         for index,chunk in enumerate(chunks):
             args={'chat_id':user,'text':chunk,'link_preview_options':{'is_disabled':True}}
-            if rows and index==len(chunks)-1: args['reply_markup']=keyboard(rows)
-            result=self.t.call('sendMessage',**args)
+            if rows and index==len(chunks)-1:
+                result=self.call_with_buttons('sendMessage',rows,**args)
+            else:
+                result=self.t.call('sendMessage',**args)
         return result
     def send_payload(self,user,p):
         if p['kind']=='text': return self.t.call('sendMessage',chat_id=user,text=p['text'],link_preview_options={'is_disabled':True})
@@ -33,7 +99,7 @@ class App:
         try:
             if q:
                 self.t.call('answerCallbackQuery',callback_query_id=q['id'])
-                self.callback(actor,q.get('data',''))
+                self.callback(actor,q.get('data',''),message_id=m.get('message_id'))
             else: self.message(actor,m)
         except (DomainError,ValueError,KeyError,IndexError) as e:
             self.send(actor,str(e) if isinstance(e,DomainError) else '输入格式不正确，请检查后重试。')
@@ -45,32 +111,112 @@ class App:
         self.send(u,f'商品列表\n可用 {a} 积分，冻结 {f} 积分\n选择商品后直接发送资料。',rows)
     def admin_home(self,u):
         self.s.admin(u)
-        self.send(u,'管理后台\n手动积分：/adjust 客户ID 增减积分 原因\n交付核实：/resolve 回单ID sent 消息ID 证据\n恢复已核实订单：/resume 订单ID 证据\n确认未送达：/resolve 回单ID retry 0 证据\n通知核实：/event 事件ID sent 消息ID 或 retry 0\n仅在核实 Telegram 记录后操作。',[[('商品管理','catalog'),('待处理订单','pending')],[('新增商品','newproduct'),('异常列表','exceptions')],[('返回客户首页','home')]])
-    def callback(self,u,data):
+        pending=self.s.one("SELECT COUNT(*) AS n FROM orders WHERE status='pending'")['n']
+        self.send(u,f'管理后台 · 待处理 {pending} 单',[
+            [('待处理订单','pending')],
+            [('商品管理','catalog'),('积分管理','adjust')],
+            [('异常处理','exceptions'),('返回客户首页','home')],
+        ])
+    def callback(self,u,data,message_id=None):
         bits=data.split(':'); action=bits[0]; args=bits[1:]
-        admin_actions={'admin','catalog','newproduct','manage','editproduct','saveproduct','move','toggle','pending','order','batch','receipts','delreceipt','finish','refund','refundyes','adjustyes','exceptions'}
+        admin_actions={'admin','catalog','newproduct','manage','editproduct','saveproduct','pfieldkind','paddfield','pfieldsdone','pkeepfields','move','toggle','pending','order','batch','bulk','bulkyes','receipts','delreceipt','finish','refund','refundyes','adjust','adjustyes','exceptions','opshelp'}
         if action in admin_actions: self.s.admin(u)
         state=self.s.session(u)
+        if action in ('catalog','manage','pending','batch','order','receipts'):
+            self.s.set_session(u,{})
         if action=='home': self.s.set_session(u,{}); self.home(u)
         elif action=='admin': self.s.set_session(u,{}); self.admin_home(u)
+        elif action=='adjust':
+            self.s.set_session(u,{'mode':'adjust_user'})
+            self.send(u,'请输入客户的 Telegram 数字 ID。',[[('取消','admin')]])
+        elif action=='opshelp':
+            self.send(u,'核实后再操作\n\n已送达回单\n/resolve 回单ID sent 消息ID 核实证据\n\n确认未送达回单\n/resolve 回单ID retry 0 核实证据\n\n恢复已核实订单\n/resume 订单ID 核实证据\n\n通知核实\n/event 事件ID sent 消息ID\n/event 事件ID retry 0',[[('返回异常处理','exceptions')]])
         elif action=='buy':
             p=self.s.product(int(args[0])); d=self.s.new_draft(u,p['id']); self.s.set_session(u,{'mode':'draft','draft':d,'field':0})
-            self.send(u,f"{p['name']} · {p['price']} 积分\n余额 {self.s.balance(u)[0]}\n{p['description']}\n预计出单：{p['eta']}\n纯文字单字段一行一单；图片/文件及多字段逐笔。")
-            self.draft_view(u,d)
+            self.draft_view(u,d,show_product=True)
         elif action=='field':
-            d=args[0]; self.s.draft(u,d); self.s.set_session(u,{'mode':'draft','draft':d,'field':int(args[1])}); self.draft_view(u,d)
+            d=args[0]
+            if self.s.draft(u,d)['status']!='editing': raise DomainError('草稿已结束，请重新选商品。')
+            self.s.set_session(u,{'mode':'draft','draft':d,'field':int(args[1])})
+            self.draft_view(u,d,prompt_only=True)
         elif action=='deldraft':
-            d=args[0]; self.s.set_field(u,d,int(args[1]),{},delete=int(args[2])); self.draft_view(u,d)
+            if len(args)!=4: raise DomainError('请重新打开草稿，使用最新的删除按钮。')
+            d=args[0]; self.s.set_field(u,d,int(args[1]),{},delete=int(args[2]),expected_version=int(args[3])); self.draft_view(u,d)
         elif action=='abandon': self.s.abandon(u,args[0]); self.s.set_session(u,{}); self.home(u)
         elif action=='confirm':
+            draft=self.s.draft(u,args[0])
+            if draft['status']=='submitted':
+                self.callback(u,'mybatch:'+draft['batch_id'])
+                return
             try: b=self.s.confirm(u,args[0],expected_version=int(args[1]))
             except DomainError:
-                if self.s.draft(u,args[0])['status']=='rejected': self.s.set_session(u,{})
-                raise
-            self.s.set_session(u,{}); self.send(u,'报单成功，积分已冻结。正式订单不可自行取消。\n批次 '+b)
+                if self.s.draft(u,args[0])['status']!='rejected': raise
+                self.s.set_session(u,{})
+                p=self.s.product(draft['product_id'])
+                total=len(self.s.submissions(draft,p))*p['price']
+                gap=total-self.s.balance(u)[0]
+                self.send(u,f'还差 {gap} 积分。充值后请重新提交。',[[('去充值','topup'),('返回','home')]])
+                return
+            self.s.set_session(u,{})
+            orders=self.s.orders(b)
+            frozen=sum(order['price'] for order in orders)
+            available=self.s.balance(u)[0]
+            receipt=f'✅ 已接单，处理中\n已冻结 {frozen} 积分 · 可用 {available} 积分'
+            rows=[[('查看订单','mybatch:'+b)]]
+            if message_id is not None:
+                try:
+                    self.call_with_buttons('editMessageText',rows,chat_id=u,message_id=message_id,text=receipt)
+                    return
+                except TelegramRejected as error:
+                    if error.code!=400: raise
+            self.send(u,receipt,rows)
+        elif action=='mybatch':
+            page=int(args[1]) if len(args)>1 else 0
+            if page<0: raise DomainError('页码无效。')
+            orders=self.s.rows('SELECT id,price,status,snapshot,submission FROM orders WHERE batch_id=? AND user_id=? ORDER BY rowid',(args[0],u))
+            if not orders: raise DomainError('找不到这笔订单。')
+            product=json.loads(orders[0]['snapshot'])['name']
+            visible=orders[page*10:(page+1)*10]
+            if not visible: raise DomainError('这一页没有订单。')
+            rows=[[(f"{page*10+i}. {order_subject(o)} · {ORDER_STATES[o['status']]}",'mineorder:'+o['id'])] for i,o in enumerate(visible,1)]
+            nav=[]
+            if page: nav.append(('上一页',f'mybatch:{args[0]}:{page-1}'))
+            if len(orders)>(page+1)*10: nav.append(('下一页',f'mybatch:{args[0]}:{page+1}'))
+            if nav: rows.append(nav)
+            rows.append([('我的订单','mine'),('返回首页','home')])
+            self.send(u,f'{product} · 共 {len(orders)} 单 · 第 {page+1} 页',rows)
         elif action=='mine':
-            for o in self.s.rows('SELECT * FROM orders WHERE user_id=? ORDER BY rowid DESC LIMIT 30',(u,)):
-                self.send(u,f"订单 {o['id']}\n状态 {o['status']} · {o['price']} 积分")
+            page=int(args[0]) if args else 0
+            if page<0 or page>100000: raise DomainError('页码无效。')
+            orders=self.s.rows('SELECT * FROM orders WHERE user_id=? ORDER BY rowid DESC LIMIT 11 OFFSET ?',(u,page*10))
+            rows=[[(f"{json.loads(o['snapshot'])['name'][:16]} · {order_subject(o)} · {ORDER_STATES[o['status']]}",'mineorder:'+o['id'])] for o in orders[:10]]
+            nav=[]
+            if page: nav.append(('上一页','mine:'+str(page-1)))
+            if len(orders)>10: nav.append(('下一页','mine:'+str(page+1)))
+            if nav: rows.append(nav)
+            rows.append([('返回首页','home')])
+            self.send(u,f'我的订单 · 第 {page+1} 页' if orders else '暂无订单。',rows)
+        elif action in ('mineorder','myreceipts'):
+            o=self.s.one('SELECT * FROM orders WHERE id=? AND user_id=?',(args[0],u))
+            if action=='myreceipts':
+                receipts=self.s.rows("SELECT payload FROM receipts WHERE order_id=? AND state='sent'",(o['id'],))
+                if o['status']!='completed' or not receipts: raise DomainError('回单正在处理中，请稍后再看。')
+                for receipt in receipts: self.send_payload(u,json.loads(receipt['payload']))
+                self.send(u,'以上为本单回单。',[[('返回订单','mineorder:'+o['id'])]])
+                return
+            p=json.loads(o['snapshot'])
+            lines=[p['name'],f"{ORDER_STATES[o['status']]} · {o['price']} 积分"]
+            attachments=[]
+            for index,items in json.loads(o['submission']).items():
+                for item in items:
+                    if item['kind']=='text': lines.append(f"{p['fields'][int(index)]['name']}：{item['text']}")
+                    else: attachments.append(item)
+            if o['reason']: lines.append('处理说明：'+o['reason'])
+            rows=[]
+            if o['status']=='completed': rows.append([('查看回单','myreceipts:'+o['id'])])
+            rows.append([('我的订单','mine'),('返回首页','home')])
+            self.send(u,'\n'.join(lines),rows)
+            for item in attachments: self.send_payload(u,item)
         elif action=='catalog':
             self.send(u,'全部商品',[[((p['name']+'（上架）' if p['active'] else p['name']+'（下架）'),'manage:'+str(p['id']))] for p in self.s.products(True)]+[[('新增','newproduct')]])
         elif action=='manage':
@@ -80,22 +226,85 @@ class App:
         elif action=='move': self.s.move_product(u,int(args[0]),int(args[1])); self.callback(u,'catalog')
         elif action in ('newproduct','editproduct'):
             p=self.s.product(int(args[0])) if args else {}
-            self.s.set_session(u,{'mode':'product','step':0,'product':p}); self.send(u,'逐项填写商品（修改时发送「保留」沿用当前值）。\n商品名称：')
+            self.s.set_session(u,{'mode':'product','step':0,'product':p})
+            self.send(u,'请输入商品名称。'+(' 修改时可发送「保留」。' if p else ''),[[('取消','admin')]])
         elif action=='saveproduct':
-            if state.get('mode')!='product_preview': raise DomainError('商品预览已失效')
+            if state.get('mode')!='product_preview' or not args or state.get('key')!=args[0]:
+                raise DomainError('商品预览已失效，请使用最新的确认按钮。')
             self.s.save_product(u,state['product']); self.s.set_session(u,{}); self.callback(u,'catalog')
+        elif action in ('pfieldkind','paddfield','pfieldsdone','pkeepfields'):
+            if not args or state.get('key')!=args[0]:
+                raise DomainError('这个按钮已失效，请使用最新提示。')
+            if action=='pfieldkind':
+                if state.get('mode')!='product_field_type' or len(args)!=2 or args[1] not in FIELD_TYPES:
+                    raise DomainError('请先填写字段名称。')
+                fields=state['product']['fields']
+                fields.append({'name':state.pop('field_name'),'kind':args[1]})
+                state.update(mode='product_fields',key=uid())
+                self.s.set_session(u,state)
+                self.product_fields_view(u,state)
+            elif action=='pkeepfields':
+                if state.get('mode')!='product_fields' or not state.get('original_fields'):
+                    raise DomainError('没有原字段可保留。')
+                state['product']['fields']=state['original_fields']
+                self.product_preview(u,state)
+            elif action=='pfieldsdone':
+                if state.get('mode')!='product_fields' or not state['product']['fields']:
+                    raise DomainError('请先添加一个字段。')
+                self.product_preview(u,state)
+            else:
+                if state.get('mode')!='product_fields' or len(state['product']['fields'])>=10:
+                    raise DomainError('最多添加 10 个字段。')
+                state.update(mode='product_field_name',key=uid())
+                self.s.set_session(u,state)
+                self.send(u,'请输入下一个字段名称。',[[('取消','admin')]])
         elif action=='pending':
-            for b in self.s.rows("SELECT DISTINCT batch_id FROM orders WHERE status IN ('pending','delivering','uncertain')"):
-                self.send(u,'批次 '+b['batch_id'],[[('查看子订单','batch:'+b['batch_id'])]])
+            batches=self.s.rows("SELECT DISTINCT batch_id FROM orders WHERE status IN ('pending','delivering','bulk_delivering','uncertain')")
+            if not batches: self.send(u,'当前没有待处理订单。',[[('返回后台','admin')]])
+            for b in batches:
+                text,rows=self.batch_card(b['batch_id'])
+                self.send(u,text,rows)
         elif action=='batch':
-            self.send(u,'批次 '+args[0],[[('订单 '+o['id']+' '+o['status'],'order:'+o['id'])] for o in self.s.orders(args[0])])
+            orders=self.s.orders(args[0])
+            if not orders: raise DomainError('找不到这批订单。')
+            product=json.loads(orders[0]['snapshot'])['name']
+            rows=[[(f"{i}. {order_subject(o)} · {ORDER_STATES[o['status']]}",'order:'+o['id'])] for i,o in enumerate(orders,1)]
+            self.send(u,f'{product} · {len(orders)} 单',rows)
+        elif action=='bulk':
+            batch=args[0]
+            orders=self.s.bulk_rows(u,batch)
+            self.s.set_session(u,{'mode':'bulk','batch':batch})
+            example=next(iter(orders))
+            accounts='\n'.join(orders)
+            self.send(u,f'请粘贴 {len(orders)} 行回单，每行「账号 结果」。\n空单写「账号 空」。\n\n例如\n{example} 查询结果\n\n待回单账号\n{accounts}',[[('取消','admin')]])
+        elif action=='bulkyes':
+            if state.get('mode')!='bulk_preview' or state.get('key')!=args[0]:
+                raise DomainError('这张回单预览已失效。')
+            self.s.queue_bulk(u,state['batch'],state['results'])
+            self.s.set_session(u,{})
+            self.send(u,'批量回单已排队。')
         elif action=='order':
             o=self.s.order(args[0]); p=json.loads(o['snapshot'])
-            result=self.send(u,f"订单 {o['id']}\n客户 {o['user_id']}\n{p['name']} {o['price']}积分 · {o['status']}\n回复本条消息暂存回单。",[[('查看暂存回单','receipts:'+o['id']),('完成订单','finish:'+o['id'])],[('空单退分','refund:'+o['id']+':empty'),('管理员取消','refund:'+o['id']+':cancel')]])
-            self.s.link_reply(result['message_id'],o['id'])
+            details=[f"{p['name']} · {ORDER_STATES[o['status']]} · {o['price']} 积分"]
+            attachments=[]
             for index,items in json.loads(o['submission']).items():
-                self.send(u,'客户字段：'+p['fields'][int(index)]['name'])
-                for item in items: self.send_payload(u,item)
+                label=p['fields'][int(index)]['name']
+                for item in items:
+                    if item['kind']=='text': details.append(f"{label}：{item['text']}")
+                    else:
+                        details.append(f"{label}：{FIELD_TYPES[item['kind']]}")
+                        attachments.append(item)
+            details.append(f"客户 {o['user_id']} · 编号 {o['id']}")
+            rows=[[('查看回单','receipts:'+o['id'])]]
+            if o['status']=='pending':
+                details.append('回复这条消息暂存回单。')
+                rows[0].append(('完成订单','finish:'+o['id']))
+                rows.append([('空单退分','refund:'+o['id']+':empty'),('管理员取消','refund:'+o['id']+':cancel')])
+            elif o['status']=='uncertain':
+                rows.append([('管理员取消','refund:'+o['id']+':cancel')])
+            result=self.send(u,'\n'.join(details),rows)
+            if o['status']=='pending': self.s.link_reply(result['message_id'],o['id'])
+            for item in attachments: self.send_payload(u,item)
         elif action=='receipts':
             for r in self.s.receipts(args[0]):
                 self.send_payload(u,json.loads(r['payload']))
@@ -112,44 +321,121 @@ class App:
             if state.get('mode')!='adjust_confirm' or state.get('key')!=args[0]: raise DomainError('确认已失效')
             self.s.adjust(u,state['user'],state['amount'],state['reason'],state['key']); self.s.set_session(u,{}); self.send(u,'积分调整已记账。')
         elif action=='exceptions':
+            self.s.set_session(u,{})
+            self.send(u,'异常处理\n请先核实客户聊天记录和账务，再执行恢复。',[[('恢复操作说明','opshelp'),('返回后台','admin')]])
             self.send(u,'异常订单：\n'+'\n'.join(o['id'] for o in self.s.rows("SELECT id FROM orders WHERE status='uncertain'")))
             for r in self.s.rows("SELECT id,order_id FROM receipts WHERE state='sending'"): self.send(u,f"待核实回单 {r['id']} / {r['order_id']}")
             for item in self.s.rows("SELECT id FROM inbox WHERE state='uncertain'"):
                 self.send(u,f"中断的入站更新 {item['id']}，请核实订单/流水后让发送者重新操作。")
             for e in self.s.events():
-                if e['state']=='uncertain': self.send(u,f"待核实通知事件 {e['id']} / {e['kind']}")
+                if e['state']=='uncertain':
+                    if e['kind']=='bulk_receipt':
+                        self.send(u,f"批量回单待核实 · 事件 {e['id']}\n核实已送达：/event {e['id']} sent 消息ID\n确认未送达：/event {e['id']} retry 0 或 /event {e['id']} cancel 0")
+                    else:
+                        self.send(u,f"待核实通知事件 {e['id']} / {e['kind']}")
         elif action=='topup':
             if not self.payments: raise DomainError('OKPay 充值暂未开放，请联系管理员。')
-            self.s.set_session(u,{'mode':'topup'}); self.send(u,'输入充值整数 USDT，最低 1 USDT（1 USDT = 1 积分）。创建结果待核实时请先检查原订单。')
-            self.payment_history(u,0)
-        elif action=='payhistory':
-            if not self.payments: raise DomainError('支付服务未开放')
-            self.payment_history(u,int(args[0]))
+            self.s.set_session(u,{'mode':'topup'})
+            self.send(u,'请输入充值金额（整数 USDT，最低 1 USDT）。\n1 USDT = 1 积分。')
         elif action=='checkpay':
             if not self.payments: raise DomainError('支付服务未开放')
             self.send(u,self.payments.check(u,args[0]))
         else: raise DomainError('按钮已失效，请发送 /start')
-    def product_text(self,p):
-        return f"{p.get('name','')}\n价格 {p.get('price','')} 积分\n{p.get('description','')}\n预计 {p.get('eta','')}\n字段："+'、'.join(f["name"]+':'+f["kind"] for f in p.get('fields',[]))
-    def draft_view(self,u,d):
-        r=self.s.draft(u,d); p=self.s.product(r['product_id']); state=self.s.session(u); index=state.get('field',0)
-        text=f"草稿（未冻结积分）\n当前填写：{p['fields'][index]['name']} / {p['fields'][index]['kind']}\n文字重发覆盖；图片/文件继续发送追加。\n"
-        rows=[]
-        for i,f in enumerate(p['fields']):
-            items=r['data'].get(str(i),[]); rows.append([(f['name'],'field:'+d+':'+str(i))])
-            for j,item in enumerate(items):
-                text+=f"{f['name']}[{j+1}]：{item.get('text',item.get('caption','附件'))}\n"
-                if item['kind']!='text': rows.append([('删除 '+f['name']+str(j+1),f'deldraft:{d}:{i}:{j}')])
+    def batch_card(self,batch,*,new=False):
+        orders=self.s.orders(batch)
+        first=orders[0]
+        product=json.loads(first['snapshot'])['name']
+        pending=sum(o['status']=='pending' for o in orders)
+        title=('新批次 · ' if new else '')+f'{product} · {len(orders)} 单'
+        details=[title,f"客户 {first['user_id']} · {pending} 单待处理"]
+        details.extend(f"{i}. {order_subject(o)} · {ORDER_STATES[o['status']]}" for i,o in enumerate(orders[:8],1))
+        if len(orders)>8: details.append(f'另有 {len(orders)-8} 单')
+        buttons=[('逐单处理','batch:'+batch)] if len(orders)>1 else [('查看订单','order:'+first['id'])]
         try:
-            count=len(self.s.submissions(r,p)); text+=f'共 {count} 笔，费用 {count*p["price"]} 积分'
-            rows.append([('确认报单','confirm:'+d+':'+str(r['edit_version']))])
-        except DomainError: text+='请继续补齐所有字段。'
-        rows.append([('放弃草稿','abandon:'+d),('返回首页','home')]); self.send(u,text,rows)
+            self.s.bulk_rows(self.s.admin_id,batch)
+        except DomainError:
+            pass
+        else:
+            buttons.insert(0,('批量回单','bulk:'+batch))
+        return '\n'.join(details),[buttons]
+    def product_text(self,p):
+        return f"{p.get('name','')}\n{p.get('price','')} 积分 / 单 · 预计 {p.get('eta','')}\n{p.get('description','')}\n提交资料："+'、'.join(f["name"]+'（'+FIELD_TYPES[f["kind"]]+'）' for f in p.get('fields',[]))
+    def product_preview(self,u,state):
+        state.update(mode='product_preview',key=uid())
+        self.s.set_session(u,state)
+        self.send(u,'商品预览\n'+self.product_text(state['product']),[
+            [('确认保存','saveproduct:'+state['key']),('取消','admin')],
+        ])
+    def product_fields_view(self,u,state):
+        fields=state['product']['fields']
+        lines=[f'{i}. {f["name"]} · {FIELD_TYPES[f["kind"]]}' for i,f in enumerate(fields,1)]
+        rows=[]
+        if fields:
+            if len(fields)<10: rows.append([('继续添加','paddfield:'+state['key'])])
+            rows.append([('填写完成','pfieldsdone:'+state['key'])])
+            text='客户需要提交的资料\n'+'\n'.join(lines)
+        else:
+            text='客户需要提交什么？请输入字段名称，例如「抖音号」。'
+            if state.get('original_fields'):
+                rows.append([('保留原字段','pkeepfields:'+state['key'])])
+        rows.append([('取消','admin')])
+        self.send(u,text,rows)
+    def adjust_preview(self,u,customer,amount,reason):
+        if customer<=0 or not amount or not reason.strip():
+            raise DomainError('客户 ID、非零积分和原因都需要填写。')
+        key=uid()
+        self.s.set_session(u,{'mode':'adjust_confirm','user':customer,'amount':amount,'reason':reason,'key':key})
+        self.send(u,f'确认调整\n客户 {customer}\n积分 {amount:+d}\n原因 {reason}',[[('确认调整','adjustyes:'+key),('取消','admin')]])
+    def draft_view(self,u,d,show_product=False,prompt_only=False):
+        r=self.s.draft(u,d); p=self.s.product(r['product_id']); state=self.s.session(u); index=state.get('field',0)
+        field=p['fields'][index]
+        batch_text=len(p['fields'])==1 and field['kind']=='text'
+        prompt=f"请发送{field['name']}。"
+        if batch_text:
+            prompt+='批量报单每行一个。'
+        elif field['kind']!='text':
+            prompt+=f"请上传{FIELD_TYPES[field['kind']]}。"
+        if show_product:
+            details=[f"🛍 {p['name']}",f"{p['price']} 积分 / 单 · 预计 {p['eta']} · 可用 {self.s.balance(u)[0]} 积分"]
+            if p['description']: details.append(p['description'])
+            details.append(prompt)
+            if batch_text: details.append('例如\nabc12345678\ndef87654321')
+            rows=[] if len(p['fields'])==1 else [[(f['name'],'field:'+d+':'+str(i))] for i,f in enumerate(p['fields'])]
+            rows.append([('返回','abandon:'+d)])
+            self.send(u,'\n\n'.join(details),rows)
+            return
+        details=[]; rows=[]
+        for i,f in enumerate(p['fields']):
+            items=r['data'].get(str(i),[])
+            if len(p['fields'])>1: rows.append([(f['name'],'field:'+d+':'+str(i))])
+            for j,item in enumerate(items):
+                value=item.get('text') or item.get('caption') or FIELD_TYPES[item['kind']]
+                details.append(f"{f['name']}：{value}")
+                if item['kind']!='text': rows.append([('删除 '+f['name']+str(j+1),f'deldraft:{d}:{i}:{j}:{r["edit_version"]}')])
+        if prompt_only or any(not r['data'].get(str(i)) for i in range(len(p['fields']))):
+            details.append(prompt)
+        else:
+            try:
+                count=len(self.s.submissions(r,p))
+                details.append(f'共 {count} 单，需 {count*p["price"]} 积分。')
+                actions=[('确认提交','confirm:'+d+':'+str(r['edit_version']))]
+                if len(p['fields'])==1: actions.append(('修改','field:'+d+':0'))
+                rows.insert(0,actions)
+            except DomainError as error:
+                details.append(str(error))
+        rows.append([('返回','abandon:'+d)])
+        self.send(u,'\n'.join(details),rows)
     def message(self,u,m):
         text=m.get('text',''); state=self.s.session(u)
         if text in ('/start','/products'): self.s.set_session(u,{}); self.home(u); return
         if text=='/admin': self.s.set_session(u,{}); self.admin_home(u); return
         if text=='/balance': self.send(u,'可用/冻结：'+str(self.s.balance(u))); return
+        if text.startswith('/paymentclose '):
+            self.s.admin(u)
+            if not self.payments: raise DomainError('支付服务未开放')
+            _,pid,disposition,reason=text.split(' ',3)
+            self.payments.close_unpaid(u,pid,disposition,reason)
+            self.send(u,'已关闭原充值单。请通过充值菜单重新建单。'); return
         if text.startswith('/paymentlink '):
             self.s.admin(u)
             if not self.payments: raise DomainError('支付服务未开放')
@@ -158,10 +444,7 @@ class App:
             self.send(u,'原充值订单链接已恢复；未加积分，客户仍须付款并查单。'); return
         if text.startswith('/adjust '):
             self.s.admin(u); _,customer,amount,reason=text.split(' ',3)
-            n=int(amount)
-            if not n or not reason.strip() or int(customer)<=0: raise DomainError('客户ID、非零整数积分与原因必填')
-            key=uid(); self.s.set_session(u,{'mode':'adjust_confirm','user':int(customer),'amount':n,'reason':reason,'key':key})
-            self.send(u,f'二次确认：客户 {customer} 调整 {n} 积分\n原因：{reason}',[[('确认调整','adjustyes:'+key),('取消','admin')]]); return
+            self.adjust_preview(u,int(customer),int(amount),reason); return
         if text.startswith('/resume '):
             self.s.admin(u); _,order,evidence=text.split(' ',2)
             self.s.resume(u,order,evidence); self.send(u,'订单已恢复交付队列。'); return
@@ -171,92 +454,203 @@ class App:
             self.s.resolve(u,int(rid),choice=='sent',int(mid),evidence); self.send(u,'已保存核实结论。'); return
         if text.startswith('/event '):
             self.s.admin(u); _,eid,choice,mid=text.split()
-            if choice not in ('sent','retry'): raise DomainError('选择 sent 或 retry')
+            if choice not in ('sent','retry','cancel'): raise DomainError('选择 sent、retry 或 cancel')
+            message_id=int(mid)
+            if choice=='sent' and message_id<1: raise DomainError('请提供已发送消息ID')
+            if choice!='sent' and message_id!=0: raise DomainError('请将未送达的消息ID填为 0')
             with self.s.tx() as c:
                 e=c.execute("SELECT * FROM events WHERE id=? AND state='uncertain'",(int(eid),)).fetchone()
                 if not e: raise DomainError('事件不在待核实状态')
-                if choice=='sent' and int(mid)<1: raise DomainError('请提供已发送消息ID')
-                c.execute('UPDATE events SET state=?,message_id=? WHERE id=?',('sent' if choice=='sent' else 'pending',int(mid),int(eid)))
+                if choice=='cancel' and e['kind']!='bulk_receipt': raise DomainError('仅批量回单可用 cancel')
+                if e['kind']=='bulk_receipt' and choice in ('sent','cancel'):
+                    self.s.finish_bulk(c,e,message_id,cancel=choice=='cancel')
+                event_state={'sent':'sent','retry':'pending','cancel':'cancelled'}[choice]
+                c.execute('UPDATE events SET state=?,message_id=?,retry_at=NULL WHERE id=?',(event_state,message_id,int(eid)))
                 self.s.audit(c,u,'event_resolve',eid,choice+':'+mid)
             self.send(u,'通知核实结果已记录。'); return
+        if state.get('mode') in ('bulk','bulk_preview'):
+            self.s.admin(u)
+            batch=state['batch']
+            self.s.set_session(u,{'mode':'bulk','batch':batch})
+            orders=self.s.bulk_rows(u,batch)
+            results={}
+            for i,line in enumerate(text.splitlines(),1):
+                if not line.strip(): continue
+                parts=line.split(maxsplit=1)
+                if len(parts)!=2: raise DomainError(f'第 {i} 行缺少结果，请填写「账号 结果」。')
+                account,result=parts
+                if account not in orders: raise DomainError(f'第 {i} 行的账号不在这批订单里。')
+                if account in results: raise DomainError(f'第 {i} 行的账号重复了。')
+                results[account]=result.strip()
+            missing=orders.keys()-results.keys()
+            if missing:
+                names='、'.join(account for account in orders if account in missing)
+                raise DomainError(f'还有 {len(missing)} 单未填写：{names}')
+            empty=sum(result=='空' for result in results.values())
+            key=uid()
+            self.s.set_session(u,{'mode':'bulk_preview','batch':batch,'results':results,'key':key})
+            preview='\n'.join(f'{account} {results[account]}' for account in orders)
+            self.send(u,f'回单预览 · 成功 {len(results)-empty} 单 · 空单 {empty} 单\n\n{preview}',
+                      [[('确认发送','bulkyes:'+key),('取消','admin')]])
+            return
         if u==self.s.admin_id and m.get('reply_to_message'):
             links=self.s.rows('SELECT order_id FROM reply_links WHERE message_id=?',(m['reply_to_message']['message_id'],))
             if not links: raise DomainError('请回复指定订单详情消息，普通聊天不会作为回单。')
             self.s.add_receipt(u,links[0]['order_id'],payload(m)); self.send(u,'已暂存，客户尚不可见。'); return
         mode=state.get('mode')
         if mode=='draft': self.s.set_field(u,state['draft'],state['field'],payload(m)); self.draft_view(u,state['draft'])
+        elif mode in ('adjust_user','adjust_amount','adjust_reason'):
+            self.s.admin(u)
+            if mode=='adjust_reason':
+                self.adjust_preview(u,state['user'],state['amount'],text)
+                return
+            try: value=int(text)
+            except ValueError: raise DomainError('请输入整数。') from None
+            if mode=='adjust_user':
+                if value<=0: raise DomainError('请输入大于 0 的客户数字 ID。')
+                state.update(mode='adjust_amount',user=value)
+                prompt='输入调整积分。加分填 5，扣分填 -5。'
+            else:
+                if not value: raise DomainError('调整积分不能为 0。')
+                state.update(mode='adjust_reason',amount=value)
+                prompt='请输入调整原因。'
+            self.s.set_session(u,state)
+            self.send(u,prompt,[[('取消','admin')]])
         elif mode=='product':
-            self.s.admin(u); keys=['name','price','description','eta','fields']; prompts=['商品名称：','整数积分价格：','商品说明/提交说明：','预计出单时间：','自定义字段，每行 名称:text 或 名称:photo 或 名称:document（1至10项）：']; i=state['step']; key=keys[i]
+            self.s.admin(u)
+            keys=['name','price','description','eta','fields']
+            prompts=['请输入商品名称。','请输入每单价格，例如 7。','请输入商品说明。','请输入预计出单时间，例如 2 小时。']
+            i=state['step']; key=keys[i]
+            if key=='fields':
+                state.update(mode='product_fields',original_fields=state['product'].get('fields',[]),key=uid())
+                state['product']['fields']=[]
+                self.s.set_session(u,state)
+                self.message(u,m)
+                return
             if text!='保留' or key not in state['product']:
-                if key=='price': value=int(text)
-                elif key=='fields':
-                    value=[]
-                    for line in text.splitlines():
-                        name,kind=line.rsplit(':',1); value.append({'name':name.strip(),'kind':kind.strip()})
-                    if not value or len(value)>10 or any(not f['name'] or f['kind'] not in ('text','photo','document') for f in value): raise DomainError('字段格式错误')
+                if key=='price':
+                    try: value=int(text)
+                    except ValueError: raise DomainError('价格请填大于 0 的整数，例如 7。') from None
                 else: value=text.strip()
                 if not value or (key=='price' and value<1): raise DomainError('内容不能为空，价格必须为正整数')
                 state['product'][key]=value
             i+=1; state['step']=i
-            if i==len(keys): state['mode']='product_preview'
+            if i==4:
+                state.update(mode='product_fields',original_fields=state['product'].get('fields',[]),key=uid())
+                state['product']['fields']=[]
+                self.s.set_session(u,state)
+                self.product_fields_view(u,state)
+            else:
+                self.s.set_session(u,state)
+                self.send(u,prompts[i],[[('取消','admin')]])
+        elif mode in ('product_fields','product_field_name'):
+            self.s.admin(u)
+            if text=='保留' and state.get('original_fields') and not state['product']['fields']:
+                state['product']['fields']=state['original_fields']
+                self.product_preview(u,state)
+                return
+            if mode=='product_fields' and state['product']['fields']:
+                raise DomainError('请点「继续添加」或「填写完成」。')
+            if ':' in text:
+                fields=[]
+                for line in text.splitlines():
+                    try: name,kind=line.rsplit(':',1)
+                    except ValueError: raise DomainError('请输入字段名称，再选择文字、图片或文件。') from None
+                    fields.append({'name':name.strip(),'kind':kind.strip()})
+                if not 1<=len(fields)<=10 or any(not f['name'] or f['kind'] not in FIELD_TYPES for f in fields):
+                    raise DomainError('请填写 1 至 10 项有效字段。')
+                if mode=='product_field_name': raise DomainError('请输入一个字段名称，再点选类型。')
+                state['product']['fields']=fields
+                self.product_preview(u,state)
+                return
+            if not text.strip() or '\n' in text: raise DomainError('请输入一个字段名称，例如「抖音号」。')
+            state.update(mode='product_field_type',field_name=text.strip(),key=uid())
             self.s.set_session(u,state)
-            if i==len(keys): self.send(u,'预览：\n'+self.product_text(state['product']),[[('确认保存并上架','saveproduct'),('放弃','admin')]])
-            else: self.send(u,prompts[i])
+            self.send(u,'「'+text.strip()+'」用什么方式提交？',[
+                [(label,'pfieldkind:'+state['key']+':'+kind) for kind,label in FIELD_TYPES.items()],
+                [('取消','admin')],
+            ])
+        elif mode=='product_field_type':
+            self.s.admin(u)
+            self.send(u,'请点选文字、图片或文件。',[
+                [(label,'pfieldkind:'+state['key']+':'+kind) for kind,label in FIELD_TYPES.items()],
+                [('取消','admin')],
+            ])
         elif mode=='refund_reason':
             self.s.admin(u); state.update(mode='refund_confirm',reason='' if text=='跳过' else text,key=uid()); self.s.set_session(u,state)
             self.send(u,f"二次确认：{state['order']} 全额退分\n原因：{state['reason'] or '未填写'}",[[('确认退款','refundyes:'+state['key']),('取消','admin')]])
         elif mode=='topup':
             if not self.payments: raise DomainError('支付未开放')
-            order=self.payments.create(u,int(text)); self.s.set_session(u,{})
-            self.payment_view(u,self.s.one('SELECT * FROM payments WHERE id=? AND user_id=?',(order['id'],u)))
+            try:
+                order_id=self.payments.create(u,int(text))['id']
+            except PaymentCreationUncertain as error:
+                order_id=error.order_id
+            self.s.set_session(u,{})
+            self.payment_view(u,self.s.one('SELECT * FROM payments WHERE id=? AND user_id=?',(order_id,u)))
         else: self.send(u,'请先选择商品；管理员请回复订单详情暂存回单。',[[('商品列表','home')]])
-    def payment_history(self,u,page):
-        for order in self.payments.recent(u,page): self.payment_view(u,order)
-        buttons=[]
-        if page>0: buttons.append(('上一页','payhistory:'+str(page-1)))
-        if self.payments.recent(u,page+1): buttons.append(('下一页','payhistory:'+str(page+1)))
-        if buttons: self.send(u,'充值历史 · 第 '+str(page+1)+' 页',[buttons])
     def payment_view(self,u,order):
         buttons=[]
         if order.get('url') and order['state']=='pending':
             buttons.append([{'text':'支付订单','url':order['url']}])
-        if not order.get('url') and order['state']!='credited':
+        if not order.get('url') and order['state'] not in ('credited','closed'):
             self.send(u,'原订单创建结果待核实，请先检查支付状态。待付但缺少链接时，请联系管理员从商户后台核对恢复。')
         buttons.append([{'text':'检查支付状态','callback_data':'checkpay:'+order['id']}])
-        self.t.call('sendMessage',chat_id=u,text=f"充值订单 {order['id']}\n{order['amount']} USDT = {order['amount']} 积分\n状态 {order['state']}（允许代付）",reply_markup={'inline_keyboard':buttons})
+        self.call_with_buttons('sendMessage',buttons,chat_id=u,text=f"充值订单 {order['id']}\n{order['amount']} USDT = {order['amount']} 积分\n状态 {order['state']}（允许代付）")
     def deliver(self):
-        for o in self.s.rows("SELECT * FROM orders WHERE status='delivering'"):
+        for o in self.s.rows("SELECT * FROM orders WHERE status='delivering' AND (retry_at IS NULL OR retry_at<=CURRENT_TIMESTAMP)"):
             try:
                 for r in self.s.receipts(o['id']):
                     if r['state']=='sent': continue
                     if r['state']!='staged': raise DomainError('投递状态不确定')
                     self.s.mark_sending(r['id'])
-                    result=self.send_payload(o['user_id'],json.loads(r['payload']))
+                    try:
+                        result=self.send_payload(o['user_id'],json.loads(r['payload']))
+                    except TelegramRejected as error:
+                        self.s.reject_receipt(o['id'],r['id'],error.retry_after)
+                        break
                     self.s.mark_sent(r['id'],result['message_id'])
-                self.s.settle(o['id'])
+                else:
+                    self.s.settle(o['id'])
             except Exception:
                 # Even a failed HTTP response may follow a successful send: never auto-replay.
                 self.s.uncertain(o['id'])
     def flush_events(self):
-        for e in self.s.rows("SELECT * FROM events WHERE state='pending' ORDER BY id"):
+        for e in self.s.rows("SELECT * FROM events WHERE state='pending' AND (retry_at IS NULL OR retry_at<=CURRENT_TIMESTAMP) ORDER BY id"):
             p=json.loads(e['payload']); rows=None
             if e['kind']=='new':
-                orders=self.s.orders(p['batch']); first=orders[0]; product=json.loads(first['snapshot'])
-                created=self.s.one('SELECT created_at FROM batches WHERE id=?',(p['batch'],))['created_at']
-                text=f"新批次 {p['batch']}\n商品：{product['name']}\n客户 {first['user_id']} · {len(orders)} 笔 · 总冻结 {sum(o['price'] for o in orders)} 积分\n创建 {created} UTC · 待处理"
-                if len(orders)==1: text+='\n订单 '+first['id']
-                rows=[[('展开子订单','batch:'+p['batch'])]]
+                text,rows=self.batch_card(p['batch'],new=True)
+            elif e['kind']=='bulk_receipt':
+                text=p['text']
+                rows=[[('查看订单','mybatch:'+p['batch'])]]
             elif e['kind']=='credited': text=f"充值已入账 {p['points']} 积分\n充值订单 {p['payment']}"
-            elif e['kind']=='summary': text=f"批次 {p['batch']} 全部结束\n成功 {p['success']}，空单/退款 {p['refund']}，扣分 {p['charged']}，退分 {p['returned']}"
-            else: text=f"订单 {p['order']} 已退 {p['points']} 积分\n{p['reason']}"
+            elif e['kind']=='summary':
+                if p['success']==1 and not p['refund']:
+                    text=f"✅ 已完成 · 已扣 {p['charged']} 积分"
+                else:
+                    text=f"报单已结束\n完成 {p['success']} 单 · 退款 {p['refund']} 单\n已扣 {p['charged']} 积分 · 已退 {p['returned']} 积分"
+                rows=[[('查看订单','mybatch:'+p['batch'])]]
+            else:
+                text=f"{order_subject(self.s.order(p['order']))} · 已退 {p['points']} 积分"
+                if p['reason']: text+='\n'+p['reason']
             with self.s.tx() as c:
                 if not c.execute("UPDATE events SET state='sending' WHERE id=? AND state='pending'",(e['id'],)).rowcount: continue
             try:
-                result=self.send(e['target'],text,rows)
+                if e['kind']=='bulk_receipt':
+                    result=self.call_with_buttons('sendMessage',rows,chat_id=e['target'],text=text,
+                                                  link_preview_options={'is_disabled':True})
+                else:
+                    result=self.send(e['target'],text,rows)
                 with self.s.tx() as c:
+                    if e['kind']=='bulk_receipt': self.s.finish_bulk(c,e,result['message_id'])
                     c.execute("UPDATE events SET state='sent',message_id=? WHERE id=?",(result['message_id'],e['id']))
                     if e['kind']=='new':
                         orders=self.s.orders(p['batch'])
                         if len(orders)==1: c.execute('INSERT OR IGNORE INTO reply_links VALUES(?,?)',(result['message_id'],orders[0]['id']))
+            except TelegramRejected as error:
+                with self.s.tx() as c:
+                    if error.retry_after is not None and (len(text)<=2000 or e['kind']=='bulk_receipt'):
+                        c.execute("UPDATE events SET state='pending',retry_at=datetime('now',?) WHERE id=?",(f'+{error.retry_after} seconds',e['id']))
+                    else:
+                        c.execute("UPDATE events SET state='uncertain' WHERE id=?",(e['id'],))
             except Exception:
                 with self.s.tx() as c: c.execute("UPDATE events SET state='uncertain' WHERE id=?",(e['id'],))

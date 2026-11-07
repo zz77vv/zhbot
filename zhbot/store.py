@@ -1,6 +1,8 @@
 """SQLite domain boundary. All money mutations are serialized and journaled."""
 import json
+import os
 import sqlite3
+import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,8 +17,17 @@ def dump(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 class Store:
-    def __init__(self, path, admin_id):
+    def __init__(self, path, admin_id, *, readonly=False):
         self.path, self.admin_id = str(path), admin_id
+        self.readonly = readonly
+        if readonly:
+            if not Path(self.path).is_file():
+                raise FileNotFoundError('Source database does not exist')
+            with self.connect() as c:
+                c.execute('SELECT version FROM schema_migrations LIMIT 1').fetchone()
+                c.execute('SELECT user_id, available, frozen FROM wallets LIMIT 1').fetchone()
+                c.execute('SELECT event_key FROM ledger LIMIT 1').fetchone()
+            return
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as c:
             c.execute('PRAGMA journal_mode=WAL')
@@ -26,8 +37,12 @@ class Store:
                 if not c.execute('SELECT 1 FROM schema_migrations WHERE version=?',(version,)).fetchone():
                     c.executescript('BEGIN IMMEDIATE;\n'+file.read_text()+f'\nINSERT INTO schema_migrations VALUES({version});\nCOMMIT;')
     @contextmanager
-    def connect(self):
-        c=sqlite3.connect(self.path, timeout=15, isolation_level=None)
+    def connect(self, *, readonly=False):
+        if self.readonly or readonly:
+            uri=Path(self.path).resolve().as_uri()+'?mode=ro'
+            c=sqlite3.connect(uri, uri=True, timeout=15, isolation_level=None)
+        else:
+            c=sqlite3.connect(self.path, timeout=15, isolation_level=None)
         c.row_factory=sqlite3.Row
         c.execute('PRAGMA foreign_keys=ON'); c.execute('PRAGMA synchronous=FULL')
         try: yield c
@@ -100,10 +115,12 @@ class Store:
             d=uid(); c.execute('INSERT INTO drafts(id,user_id,product_id,revision) VALUES(?,?,?,?)',(d,user,pid,p['revision'])); return d
     def draft(self,user,d):
         r=self.one('SELECT * FROM drafts WHERE id=? AND user_id=?',(d,user)); r['data']=json.loads(r['data']); return r
-    def set_field(self,user,d,index,payload,delete=None):
+    def set_field(self,user,d,index,payload,delete=None,expected_version=None):
         with self.tx() as c:
             r=c.execute("SELECT * FROM drafts WHERE id=? AND user_id=? AND status='editing'",(d,user)).fetchone()
             if not r: raise DomainError('草稿已失效，请重新选商品')
+            if expected_version is not None and r['edit_version']!=expected_version:
+                raise DomainError('资料已修改，请使用最新的删除按钮。')
             p=self.product(r['product_id']); fields=p['fields']
             if index<0 or index>=len(fields): raise DomainError('字段不存在')
             data=json.loads(r['data']); key=str(index)
@@ -156,6 +173,66 @@ class Store:
         return self.rows('SELECT * FROM orders'+(' WHERE batch_id=?' if batch else '')+' ORDER BY rowid',(batch,) if batch else ())
     def order(self,o): return self.one('SELECT * FROM orders WHERE id=?',(o,))
     def receipts(self,o): return self.rows('SELECT * FROM receipts WHERE order_id=? ORDER BY id',(o,))
+    def bulk_rows(self,actor,batch):
+        self.admin(actor)
+        with self.connect() as c:
+            return self._bulk_rows(c,batch)
+    def _bulk_rows(self,c,batch):
+        orders=c.execute(
+            "SELECT o.*, EXISTS(SELECT 1 FROM receipts WHERE order_id=o.id) AS has_receipt "
+            "FROM orders o WHERE o.batch_id=? ORDER BY o.rowid",(batch,)
+        ).fetchall()
+        if len(orders)<2 or any(o['status']!='pending' or o['has_receipt'] for o in orders):
+            raise DomainError('仅全批待处理且未暂存回单时可批量回单。')
+        rows={}
+        for o in orders:
+            fields=json.loads(o['snapshot'])['fields']
+            if len(fields)!=1 or fields[0]['kind']!='text':
+                raise DomainError('批量回单仅支持单个文字字段的商品。')
+            account=json.loads(o['submission'])['0'][0]['text']
+            if len(account.split())!=1 or account in rows:
+                raise DomainError('批次含重复账号或带空格的资料，请逐单处理。')
+            rows[account]=dict(o)
+        return rows
+    def queue_bulk(self,actor,batch,results):
+        self.admin(actor)
+        with self.tx() as c:
+            orders=self._bulk_rows(c,batch)
+            if orders.keys()!=results.keys() or any(not value.strip() or '\n' in value or '\r' in value for value in results.values()):
+                raise DomainError('回单必须与这批账号一一对应。')
+            items={order['id']:results[account] for account,order in orders.items()}
+            charged=sum(o['price'] for account,o in orders.items() if results[account]!='空')
+            returned=sum(o['price'] for account,o in orders.items() if results[account]=='空')
+            lines='\n'.join(f'{account} {results[account]}' for account in orders)
+            text=f'📋 回单结果\n\n{lines}\n\n扣费 {charged} 积分 · 退回 {returned} 积分'
+            if len(text.encode('utf-16-le'))//2>4000:
+                raise DomainError('回单太长，请缩短结果或逐单处理。')
+            first=next(iter(orders.values()))
+            c.execute("UPDATE orders SET status='bulk_delivering' WHERE batch_id=?",(batch,))
+            c.execute('INSERT INTO events(event_key,kind,target,payload) VALUES(?,?,?,?)',
+                      ('bulk:'+uid(),'bulk_receipt',first['user_id'],dump({'batch':batch,'items':items,'text':text,'actor':actor})))
+            self.audit(c,actor,'bulk_queue',batch,f'{len(items)} 单')
+    def finish_bulk(self,c,event,message_id,*,cancel=False):
+        if not cancel and (type(message_id) is not int or message_id<=0):
+            raise DomainError('缺少回单消息编号。')
+        payload=json.loads(event['payload'])
+        orders=c.execute('SELECT * FROM orders WHERE batch_id=?',(payload['batch'],)).fetchall()
+        if not orders or any(o['status']!='bulk_delivering' for o in orders):
+            raise DomainError('批次状态已改变，请核实回单。')
+        for order in orders:
+            oid=order['id']
+            result=payload['items'][oid]
+            price=order['price']
+            if cancel or result=='空':
+                reason='批量回单确认未送达' if cancel else '批量回单空单'
+                self.money(c,order['user_id'],price,-price,'refund:'+oid,reason)
+                c.execute('UPDATE orders SET status=?,reason=? WHERE id=?',('cancel' if cancel else 'empty',reason,oid))
+            else:
+                self.money(c,order['user_id'],0,-price,'charge:'+oid,'批量回单扣费')
+                c.execute("UPDATE orders SET status='completed' WHERE id=?",(oid,))
+                c.execute("INSERT INTO receipts(order_id,payload,state,message_id) VALUES(?,?,'sent',?)",
+                          (oid,dump({'kind':'text','text':result}),message_id))
+        self.audit(c,payload['actor'],'bulk_cancel' if cancel else 'bulk_finish',payload['batch'],str(message_id))
     def add_receipt(self,actor,o,payload):
         self.admin(actor)
         if payload.get('kind') not in ('text','photo','document'): raise DomainError('回单类型不支持')
@@ -186,6 +263,14 @@ class Store:
         with self.tx() as c: c.execute("UPDATE receipts SET state='sent',message_id=? WHERE id=? AND state='sending'",(message_id,rid))
     def uncertain(self,o):
         with self.tx() as c: c.execute("UPDATE orders SET status='uncertain' WHERE id=? AND status='delivering'",(o,))
+    def reject_receipt(self,o,rid,retry_after):
+        with self.tx() as c:
+            updated=c.execute("UPDATE receipts SET state='staged' WHERE id=? AND order_id=? AND state='sending'",(rid,o))
+            if updated.rowcount!=1: raise DomainError('回单状态已变更')
+            if retry_after is None:
+                c.execute("UPDATE orders SET status='uncertain',retry_at=NULL WHERE id=?",(o,))
+            else:
+                c.execute("UPDATE orders SET retry_at=datetime('now',?) WHERE id=?",(f'+{retry_after} seconds',o))
     def resolve(self,actor,rid,delivered,message_id,evidence):
         self.admin(actor)
         if not evidence.strip() or (delivered and message_id<=0): raise DomainError('必须填写核实证据；已送达须提供消息ID')
@@ -216,7 +301,12 @@ class Store:
         with self.tx() as c:
             old=c.execute('SELECT * FROM orders WHERE id=?',(o,)).fetchone()
             if old and old['status']==kind: return
-            r=self.require_pending(c,o)
+            if old and old['status']=='uncertain' and kind=='cancel':
+                if not reason.strip() or c.execute("SELECT 1 FROM receipts WHERE order_id=? AND state!='staged'",(o,)).fetchone():
+                    raise DomainError('仅全部回单明确未送达且填写原因时才可取消')
+                r=old
+            else:
+                r=self.require_pending(c,o)
             if kind=='empty' and c.execute('SELECT 1 FROM receipts WHERE order_id=?',(o,)).fetchone(): raise DomainError('有回单不可按空单退款')
             self.money(c,r['user_id'],r['price'],-r['price'],'refund:'+o,'空单退款' if kind=='empty' else '管理员取消',reason)
             c.execute('UPDATE orders SET status=?,reason=? WHERE id=?',(kind,reason,o)); self.audit(c,actor,kind,o,reason)
@@ -239,7 +329,27 @@ class Store:
     def link_reply(self,message_id,o):
         with self.tx() as c: c.execute('INSERT OR IGNORE INTO reply_links VALUES(?,?)',(message_id,o))
     def backup(self,dest):
-        with self.connect() as c:
-            target=sqlite3.connect(str(dest))
-            try: c.backup(target)
-            finally: target.close()
+        destination=Path(dest).absolute()
+        if os.path.lexists(destination):
+            raise FileExistsError('Backup destination already exists')
+        fd, name=tempfile.mkstemp(prefix='.zhbot-backup-', dir=destination.parent)
+        staging=Path(name)
+        os.close(fd)
+        try:
+            with self.connect(readonly=True) as source:
+                target=sqlite3.connect(staging)
+                try:
+                    source.backup(target)
+                    if target.execute('PRAGMA integrity_check').fetchall()!=[('ok',)]:
+                        raise sqlite3.DatabaseError('Backup integrity check failed')
+                finally:
+                    target.close()
+            with staging.open('r+b') as completed:
+                os.fsync(completed.fileno())
+            # Publish only a complete snapshot, with no replacement of any existing path.
+            if os.name=='nt':
+                os.rename(staging,destination)
+            else:
+                os.link(staging,destination)
+        finally:
+            staging.unlink(missing_ok=True)

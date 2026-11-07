@@ -7,7 +7,8 @@ log=logging.getLogger(__name__)
 class Runtime:
     def __init__(self,store,app,telegram): self.s,self.app,self.t=store,app,telegram
     def offset(self):
-        rows=self.s.rows('SELECT MAX(id) AS last FROM inbox')
+        # Telegram may choose a lower update ID after a week without updates.
+        rows=self.s.rows("SELECT MAX(id) AS last FROM inbox WHERE created_at > datetime('now','-6 days')")
         return (rows[0]['last']+1) if rows[0]['last'] is not None else 0
     def recover(self):
         self.s.recover()
@@ -15,6 +16,11 @@ class Runtime:
     def dispatch(self,update):
         ident=update['update_id']
         with self.s.tx() as c:
+            old=c.execute("SELECT * FROM inbox WHERE id=? AND created_at<=datetime('now','-6 days')",(ident,)).fetchone()
+            if old:
+                c.execute('INSERT INTO inbox_archive(update_id,state,created_at) VALUES(?,?,?)',
+                          (old['id'],old['state'],old['created_at']))
+                c.execute('DELETE FROM inbox WHERE id=?',(ident,))
             if not c.execute("INSERT OR IGNORE INTO inbox(id,state) VALUES(?,'processing')",(ident,)).rowcount: return
         self.app.handle(update)
         with self.s.tx() as c: c.execute("UPDATE inbox SET state='done' WHERE id=?",(ident,))
