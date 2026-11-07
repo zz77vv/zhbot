@@ -16,24 +16,23 @@ BUTTON_STYLES = {
     **dict.fromkeys(('取消','取消报单','确认取消','管理员取消','空单退分','确认退款','删除','放弃'), 'danger'),
 }
 BUTTON_ICONS = {
-    # Selected from https://t.me/addemoji/yingzihuiyuan9 after inspecting thumbnails.
-    '充值': ('💵','4988068987716764567'),
-    '充值积分': ('💵','4988068987716764567'),
-    '去充值': ('💵','4988068987716764567'),
-    '支付订单': ('💸','4988068987716764567'),
-    '去付款': ('💸','4988068987716764567'),
-    '我的订单': ('🔖','4985872253678781168'),
-    '查看订单': ('🔍','4987889505328431871'),
-    '检查到账': ('🔍','4987889505328431871'),
-    '确认提交': ('✔️','4987968902093865732'),
-    '确认发送': ('✔️','4987968902093865732'),
-    '发送回单': ('✉️','4987876955433993117'),
-    '批量回单': ('✉️','4987876955433993117'),
-    '管理后台': ('⚙️','4987895501102777018'),
+    # Verified custom emoji from https://t.me/addemoji/NewsEmoji.
+    '充值': ('💵','5409048419211682843'),
+    '充值积分': ('💵','5409048419211682843'),
+    '去充值': ('💵','5409048419211682843'),
+    '支付订单': ('💸','5233326571099534068'),
+    '去付款': ('💸','5233326571099534068'),
+    '我的订单': ('🔖','5222444124698853913'),
+    '查看订单': ('🔍','5231012545799666522'),
+    '检查到账': ('🔍','5231012545799666522'),
+    '确认提交': ('✔️','5206607081334906820'),
+    '确认发送': ('✔️','5206607081334906820'),
+    '发送回单': ('✉️','5253742260054409879'),
+    '批量回单': ('✉️','5253742260054409879'),
+    '管理后台': ('⚙️','5341715473882955310'),
 }
-UI_ICONS = {'🛍':'4988146357257634651','💵':'4988068987716764567',
-            '✔️':'4987968902093865732','✉️':'4987876955433993117'}
-THEME_ALT='💎'
+UI_ICONS = {'🛍':'5229064374403998351','💵':'5409048419211682843',
+            '✔️':'5206607081334906820','✉️':'5253742260054409879'}
 
 
 def ui_entities(text):
@@ -45,17 +44,6 @@ def ui_entities(text):
                              'length':len(emoji.encode('utf-16-le'))//2,'custom_emoji_id':emoji_id})
             start=index+len(emoji)
     return sorted(entities,key=lambda entity:entity['offset'])
-
-
-def themed_text(text,entities):
-    # This pack uses the same two-unit fallback for every icon. Keep the real
-    # fallback in the API text; restore the semantic source text on rejection.
-    encoded=text.encode('utf-16-le')
-    for entity in reversed(entities):
-        if entity['type']=='custom_emoji' and entity['custom_emoji_id'] in UI_ICONS.values():
-            start,end=entity['offset']*2,(entity['offset']+entity['length'])*2
-            encoded=encoded[:start]+THEME_ALT.encode('utf-16-le')+encoded[end:]
-    return encoded.decode('utf-16-le')
 
 
 def keyboard(rows, custom_emoji=True):
@@ -105,11 +93,8 @@ class App(PaymentUI,AdminUI):
         if not self.custom_emoji and 'entities' in data:
             data['entities']=[e for e in data['entities'] if e['type']!='custom_emoji']
         markup=keyboard(rows,self.custom_emoji)
-        wire_data=dict(data)
-        if self.custom_emoji and data.get('entities') and 'text' in data:
-            wire_data['text']=themed_text(data['text'],data['entities'])
         try:
-            return self.t.call(method,reply_markup=markup,**wire_data)
+            return self.t.call(method,reply_markup=markup,**data)
         except TelegramRejected as error:
             if method=='editMessageText' and error.reason=='not_modified':
                 return {'message_id':data['message_id']}

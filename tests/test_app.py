@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 from test_domain import Fixture
-from zhbot.app import App, UI_ICONS, THEME_ALT
+from zhbot.app import App, UI_ICONS
 from zhbot.telegram import TelegramRejected
 
 class Telegram:
@@ -26,7 +26,7 @@ class AppTests(Fixture, unittest.TestCase):
         encoded=request['text'].encode('utf-16-le')
         for entity in entities:
             self.assertEqual('custom_emoji',entity['type'])
-            self.assertEqual(THEME_ALT,encoded[entity['offset']*2:(entity['offset']+entity['length'])*2].decode('utf-16-le'))
+            self.assertEqual(emoji,encoded[entity['offset']*2:(entity['offset']+entity['length'])*2].decode('utf-16-le'))
     def test_home_balance_layout_and_pagination(self):
         for index in range(1,9):
             self.s.save_product(99,dict(name=('长名称'*8 if index==2 else f'服务{index}'),price=2,
@@ -35,7 +35,7 @@ class AppTests(Fixture, unittest.TestCase):
         card=self.t.calls[-1][1]
         self.assertIn('可用积分：10',card['text'])
         encoded=card['text'].encode('utf-16-le')
-        self.assertEqual([THEME_ALT,THEME_ALT],[encoded[e['offset']*2:(e['offset']+e['length'])*2].decode('utf-16-le') for e in card['entities']])
+        self.assertEqual(['🛍','💵'],[encoded[e['offset']*2:(e['offset']+e['length'])*2].decode('utf-16-le') for e in card['entities']])
         self.assertNotIn('冻结',card['text'])
         self.assertIn('第 1 / 2 页',card['text'])
         rows=card['reply_markup']['inline_keyboard']
@@ -84,7 +84,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.assertEqual(2,len(first['entities']))
         self.assertEqual([],retry['entities'])
         self.assertEqual([],later['entities'])
-        self.assertEqual(first['text'].replace(THEME_ALT,''),retry['text'].replace('🛍','').replace('💵',''))
+        self.assertEqual(first['text'],retry['text'])
         self.assertNotIn('icon_custom_emoji_id',retry['reply_markup']['inline_keyboard'][-1][0])
         self.app.custom_emoji=True
         with patch.object(self.t,'call',side_effect=TimeoutError()) as call:
@@ -152,7 +152,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.assert_custom_icon(first,'✔️',UI_ICONS['✔️'])
         self.assertFalse(any(e['type']=='custom_emoji' for e in retry.get('entities',[])))
         self.assertFalse(any(e['type']=='custom_emoji' for e in later.get('entities',[])))
-        self.assertEqual(first['text'].replace(THEME_ALT,''),retry['text'].replace('✔️',''))
+        self.assertEqual(first['text'],retry['text'])
         self.app.custom_emoji=True
         with patch.object(self.t,'call',side_effect=TimeoutError()) as call:
             with self.assertRaises(TimeoutError): self.app.send(1,'✔️ 已完成')
