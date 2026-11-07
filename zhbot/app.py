@@ -26,6 +26,7 @@ BUTTON_ICONS = {
     '确认发送': ('✔️','5206607081334906820'),
     '批量回单': ('✉️','5253742260054409879'),
 }
+HOME_ICONS = {'🛍':'5229064374403998351','💵':'5409048419211682843'}
 
 
 def keyboard(rows, custom_emoji=True):
@@ -69,14 +70,19 @@ class App:
         self.s,self.t,self.payments=store,telegram,payments
         self.custom_emoji=True
     def call_with_buttons(self,method,rows,**data):
+        if not self.custom_emoji and 'entities' in data:
+            data['entities']=[e for e in data['entities'] if e['type']!='custom_emoji']
         markup=keyboard(rows,self.custom_emoji)
         try:
             return self.t.call(method,reply_markup=markup,**data)
         except TelegramRejected as error:
-            if error.code!=400 or not any(
+            has_custom=any(
                 'icon_custom_emoji_id' in button for row in markup['inline_keyboard'] for button in row
-            ):
+            ) or any(e['type']=='custom_emoji' for e in data.get('entities',[]))
+            if error.code!=400 or not has_custom:
                 raise
+            if 'entities' in data:
+                data['entities']=[e for e in data['entities'] if e['type']!='custom_emoji']
             result=self.t.call(method,reply_markup=keyboard(rows,custom_emoji=False),**data)
             self.custom_emoji=False
             return result
@@ -111,7 +117,7 @@ class App:
         page=max(0,min(page,pages-1))
         rows=[]
         for p in products[page*8:(page+1)*8]:
-            button=(p['name']+' · '+str(p['price'])+'积分','buy:'+str(p['id']))
+            button=(p['name'],'buy:'+str(p['id']))
             if len(button[0])<=18 and rows and len(rows[-1])==1 and len(rows[-1][0][0])<=18:
                 rows[-1].append(button)
             else:
@@ -123,18 +129,22 @@ class App:
             rows.append(nav)
         rows.append([('充值积分','topup')])
         if u==self.s.admin_id: rows.append([('管理后台','admin')])
-        lines=['🛍 综合服务','',f'💰 可用积分：{a}']
+        lines=['🛍 综合服务','',f'💵 可用积分：{a}']
         if f: lines.append(f'冻结积分：{f}')
         lines += ['', '请选择需要的服务' if products else '暂无上架服务']
         if pages>1: lines.append(f'第 {page+1} / {pages} 页')
         text='\n'.join(lines)
+        entities=[{'type':'custom_emoji','offset':len(text[:text.index(emoji)].encode('utf-16-le'))//2,
+                   'length':len(emoji.encode('utf-16-le'))//2,'custom_emoji_id':emoji_id}
+                  for emoji,emoji_id in HOME_ICONS.items()]
         if message_id is not None:
             try:
-                self.call_with_buttons('editMessageText',rows,chat_id=u,message_id=message_id,text=text)
+                self.call_with_buttons('editMessageText',rows,chat_id=u,message_id=message_id,text=text,entities=entities)
                 return
             except TelegramRejected as error:
                 if error.code!=400: raise
-        self.send(u,text,rows)
+        self.call_with_buttons('sendMessage',rows,chat_id=u,text=text,entities=entities,
+                               link_preview_options={'is_disabled':True})
     def admin_home(self,u):
         self.s.admin(u)
         pending=self.s.one("SELECT COUNT(*) AS n FROM orders WHERE status='pending'")['n']

@@ -26,7 +26,9 @@ class AppTests(Fixture, unittest.TestCase):
                                        description='',eta='',fields=[{'name':'资料','kind':'text'}]))
         self.msg('/start')
         card=self.t.calls[-1][1]
-        self.assertIn('💰 可用积分：10',card['text'])
+        self.assertIn('💵 可用积分：10',card['text'])
+        encoded=card['text'].encode('utf-16-le')
+        self.assertEqual(['🛍','💵'],[encoded[e['offset']*2:(e['offset']+e['length'])*2].decode('utf-16-le') for e in card['entities']])
         self.assertNotIn('冻结',card['text'])
         self.assertIn('第 1 / 2 页',card['text'])
         rows=card['reply_markup']['inline_keyboard']
@@ -34,6 +36,8 @@ class AppTests(Fixture, unittest.TestCase):
         goods=[row for row in goods if row]
         self.assertEqual([2,1,2,2,1],[len(row) for row in goods])
         self.assertTrue(all(b['style']=='success' for row in goods for b in row))
+        self.assertEqual('查询',goods[0][0]['text'])
+        self.assertFalse(any('积分' in b['text'] for row in goods for b in row))
         recharge=rows[-1][0]
         self.assertEqual('充值积分',recharge['text'])
         self.assertEqual('primary',recharge['style'])
@@ -43,6 +47,7 @@ class AppTests(Fixture, unittest.TestCase):
         method,card=self.t.calls[-1]
         self.assertEqual('editMessageText',method)
         self.assertIn('第 2 / 2 页',card['text'])
+        self.assertEqual(2,len(card['entities']))
         self.assertEqual('home:0',card['reply_markup']['inline_keyboard'][1][0]['callback_data'])
         last=self.s.products()[-1]
         last['active']=0
@@ -64,6 +69,20 @@ class AppTests(Fixture, unittest.TestCase):
         self.assertEqual(1,len(card['reply_markup']['inline_keyboard']))
         self.msg('/start',99)
         self.assertEqual('admin',self.t.calls[-1][1]['reply_markup']['inline_keyboard'][-1][0]['callback_data'])
+    def test_home_custom_emoji_rejection_falls_back_but_timeout_does_not_retry(self):
+        with patch.object(self.t,'call',side_effect=[TelegramRejected(400),{'message_id':1},{'message_id':2}]) as call:
+            self.app.home(1)
+            self.app.home(1)
+        first,retry,later=[request.kwargs for request in call.call_args_list]
+        self.assertEqual(2,len(first['entities']))
+        self.assertEqual([],retry['entities'])
+        self.assertEqual([],later['entities'])
+        self.assertEqual(first['text'],retry['text'])
+        self.assertNotIn('icon_custom_emoji_id',retry['reply_markup']['inline_keyboard'][-1][0])
+        self.app.custom_emoji=True
+        with patch.object(self.t,'call',side_effect=TimeoutError()) as call:
+            with self.assertRaises(TimeoutError): self.app.home(1)
+        self.assertEqual(1,call.call_count)
     def test_customer_draft_edit_and_confirm(self):
         self.msg('/start')
         self.assertNotIn('mine',str(self.t.calls[-1][1]['reply_markup']))
