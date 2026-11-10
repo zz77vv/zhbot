@@ -13,6 +13,8 @@ ORDER_LABELS = {
 
 
 def subject(order):
+    if order.get('data_cleared_at'):
+        return '资料已清理'
     for items in json.loads(order['submission']).values():
         for item in items:
             if item['kind'] == 'text':
@@ -30,6 +32,25 @@ def fingerprint(snapshot):
 
 
 class AdminUI:
+    def retention_status(self, u):
+        from .retention import Retention
+        self.s.admin(u)
+        status = Retention(self.s).status()
+        labels = {'sessions':'临时会话', 'drafts':'草稿', 'orders':'订单资料',
+                  'inbox':'已处理消息', 'inbox_archive':'旧消息记录', 'events':'成功通知正文'}
+        states = {'not_initialized':'等待初始化', 'scheduled':'等待执行',
+                  'running':'清理中', 'complete':'上次清理完成', 'failed':'失败，等待重试'}
+        lines = ['数据库管理', '每 14 天执行；不备份。',
+                 '状态：'+states.get(status['state'], status['state']),
+                 f"数据库及 WAL：{status['database_bytes']/1024:.1f} KiB",
+                 '上次完成（UTC）：'+str(status.get('last_success') or '尚未执行'),
+                 '下次执行（UTC）：'+str(status.get('next_run') or '等待初始化')]
+        for key, count in status.get('counts', {}).items():
+            lines.append(labels.get(key,key)+'：'+str(count))
+        if status.get('error'): lines.append('错误类型：'+status['error'])
+        lines.append('资金流水、结算摘要、未完成及异常业务保留。')
+        return self.card(u, '\n'.join(lines), [[('刷新','database'),('返回后台','admin')]])
+
     def pending_view(self, u, page=0, message_id=None):
         self.s.admin(u)
         batches = self.s.rows(

@@ -1,11 +1,14 @@
 """Single-process long polling. Interrupted inbound updates are quarantined."""
 import logging
 import time
+from .retention import Retention
 
 log=logging.getLogger(__name__)
 
 class Runtime:
-    def __init__(self,store,app,telegram): self.s,self.app,self.t=store,app,telegram
+    def __init__(self,store,app,telegram):
+        self.s,self.app,self.t=store,app,telegram
+        self.retention=Retention(store)
     def offset(self):
         # Telegram may choose a lower update ID after a week without updates.
         rows=self.s.rows("SELECT MAX(id) AS last FROM inbox WHERE created_at > datetime('now','-6 days')")
@@ -26,8 +29,14 @@ class Runtime:
         with self.s.tx() as c: c.execute("UPDATE inbox SET state='done' WHERE id=?",(ident,))
     def run(self):
         self.recover()
+        maintenance_at=0
         while True:
             try:
+                if time.monotonic()>=maintenance_at:
+                    maintenance_at=time.monotonic()+60
+                    try: self.retention.tick()
+                    except Exception as error:
+                        log.error('Maintenance unavailable (%s)',type(error).__name__)
                 self.app.deliver(); self.app.flush_events()
                 updates=self.t.call('getUpdates',offset=self.offset(),timeout=25,allowed_updates=['message','callback_query'])
                 for update in updates:

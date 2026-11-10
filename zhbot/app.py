@@ -76,6 +76,7 @@ def payload(m):
     raise DomainError('仅支持文字、图片和文件')
 
 def order_subject(order):
+    if order.get('data_cleared_at'): return '资料已清理'
     for items in json.loads(order['submission']).values():
         for item in items:
             if item['kind']=='text':
@@ -184,11 +185,12 @@ class App(PaymentUI,AdminUI):
         self.send(u,f'管理后台 · 待处理 {pending} 单',[
             [('待处理订单','pending')],
             [('商品管理','catalog'),('积分管理','adjust')],
+            [('数据库管理','database')],
             [('异常处理','exceptions'),('返回客户首页','home')],
         ])
     def callback(self,u,data,message_id=None):
         bits=data.split(':'); action=bits[0]; args=bits[1:]
-        admin_actions={'admin','catalog','newproduct','manage','editproduct','saveproduct','pfieldkind','paddfield','pfieldsdone','pkeepfields','move','toggle','pending','order','batch','bulk','bulkyes','receipts','delreceipt','finish','sendreceipt','refund','refundyes','adjust','adjustyes','exceptions','opshelp'}
+        admin_actions={'admin','database','catalog','newproduct','manage','editproduct','saveproduct','pfieldkind','paddfield','pfieldsdone','pkeepfields','move','toggle','pending','order','batch','bulk','bulkyes','receipts','delreceipt','finish','sendreceipt','refund','refundyes','adjust','adjustyes','exceptions','opshelp'}
         if action in admin_actions: self.s.admin(u)
         state=self.s.session(u)
         if action in ('catalog','manage','pending','batch','order','receipts'):
@@ -197,6 +199,7 @@ class App(PaymentUI,AdminUI):
             self.s.set_session(u,{})
             self.home(u,int(args[0]) if args else 0,message_id=message_id if args else None)
         elif action=='admin': self.s.set_session(u,{}); self.admin_home(u)
+        elif action=='database': self.retention_status(u)
         elif action=='adjust':
             self.s.set_session(u,{'mode':'adjust_user'})
             self.send(u,'请输入客户的 Telegram 数字 ID。',[[('取消','admin')]])
@@ -295,6 +298,7 @@ class App(PaymentUI,AdminUI):
         elif action in ('mineorder','myreceipts'):
             o=self.s.one('SELECT * FROM orders WHERE id=? AND user_id=?',(args[0],u))
             if action=='myreceipts':
+                if o.get('data_cleared_at'): raise DomainError('回单内容已按保留规则清理，订单结算记录仍保留。')
                 receipts=self.s.rows("SELECT payload FROM receipts WHERE order_id=? AND state='sent'",(o['id'],))
                 if o['status']!='completed' or not receipts: raise DomainError('回单正在处理中，请稍后再看。')
                 for receipt in receipts: self.send_payload(u,json.loads(receipt['payload']))
@@ -302,6 +306,7 @@ class App(PaymentUI,AdminUI):
                 return
             p=json.loads(o['snapshot'])
             lines=[p['name'],f"{ORDER_STATES[o['status']]} · {o['price']} 积分"]
+            if o.get('data_cleared_at'): lines.append('原始资料及回单内容已按保留规则清理。')
             attachments=[]
             for index,items in json.loads(o['submission']).items():
                 for item in items:
@@ -374,6 +379,7 @@ class App(PaymentUI,AdminUI):
         elif action=='order':
             o=self.s.order(args[0]); p=json.loads(o['snapshot'])
             details=[f"{p['name']} · {ORDER_STATES[o['status']]} · {o['price']} 积分"]
+            if o.get('data_cleared_at'): details.append('原始资料及回单内容已按保留规则清理。')
             attachments=[]
             for index,items in json.loads(o['submission']).items():
                 label=p['fields'][int(index)]['name']
@@ -394,6 +400,8 @@ class App(PaymentUI,AdminUI):
             if o['status']=='pending': self.s.link_reply(result['message_id'],o['id'])
             for item in attachments: self.send_payload(u,item)
         elif action=='receipts':
+            if self.s.order(args[0]).get('data_cleared_at'):
+                raise DomainError('回单内容已按保留规则清理，订单结算记录仍保留。')
             for r in self.s.receipts(args[0]):
                 self.send_payload(u,json.loads(r['payload']))
                 self.send(u,f"回单 {r['id']} · {r['state']}",[[('删除','delreceipt:'+args[0]+':'+str(r['id']))]])
@@ -738,6 +746,7 @@ class App(PaymentUI,AdminUI):
                 if text.startswith('📋 回单结果'):
                     text='✉️'+text[1:]
             elif e['kind']=='credited': text=''
+            elif e['kind']=='maintenance': text=p['text']
             elif e['kind']=='summary':
                 if p['success']==1 and not p['refund']:
                     text=f"✔️ 已完成 · 已扣 {p['charged']} 积分"

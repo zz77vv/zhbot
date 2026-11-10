@@ -336,7 +336,7 @@ class Store:
     def session(self,user):
         r=self.rows('SELECT data FROM sessions WHERE user_id=?',(user,)); return json.loads(r[0]['data']) if r else {}
     def set_session(self,user,data):
-        with self.tx() as c: c.execute('INSERT INTO sessions VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data',(user,dump(data)))
+        with self.tx() as c: c.execute('INSERT INTO sessions(user_id,data) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data',(user,dump(data)))
     def link_reply(self,message_id,o):
         with self.tx() as c: c.execute('INSERT OR IGNORE INTO reply_links VALUES(?,?)',(message_id,o))
     def backup(self,dest):
