@@ -7,6 +7,7 @@ from .admin_ui import AdminUI
 
 
 FIELD_TYPES = {'text':'文字','photo':'图片','document':'文件'}
+PRODUCT_PLACEMENTS = {'home':'首页','region':'地区神父'}
 ORDER_STATES = {
     'pending':'处理中', 'delivering':'发送回单中', 'bulk_delivering':'发送回单中', 'uncertain':'待核实',
     'completed':'已完成', 'empty':'已退款', 'cancel':'已退款',
@@ -146,9 +147,10 @@ class App(PaymentUI,AdminUI):
             else: self.message(actor,m)
         except (DomainError,ValueError,KeyError,IndexError) as e:
             self.send(actor,str(e) if isinstance(e,DomainError) else '输入格式不正确，请检查后重试。')
-    def home(self,u,page=0,message_id=None):
+    def home(self,u,page=0,message_id=None,placement='home'):
         a,f=self.s.balance(u)
-        products=self.s.products()
+        products=self.s.products(placement=placement)
+        page_action='home' if placement=='home' else 'region'
         pages=max(1,(len(products)+7)//8)
         page=max(0,min(page,pages-1))
         rows=[]
@@ -160,14 +162,20 @@ class App(PaymentUI,AdminUI):
                 rows.append([button])
         if pages>1:
             nav=[]
-            if page: nav.append(('上一页',f'home:{page-1}'))
-            if page+1<pages: nav.append(('下一页',f'home:{page+1}'))
+            if page: nav.append(('上一页',f'{page_action}:{page-1}'))
+            if page+1<pages: nav.append(('下一页',f'{page_action}:{page+1}'))
             rows.append(nav)
+        if placement=='home':
+            rows.append([('地区神父','region')])
+        else:
+            rows.append([('返回首页','home:0')])
         rows.append([('充值积分','topup')])
-        if u==self.s.admin_id: rows.append([('管理后台','admin')])
-        lines=['🛍 综合服务','',f'💵 可用积分：{a}']
+        if placement=='home' and u==self.s.admin_id: rows.append([('管理后台','admin')])
+        title='综合服务' if placement=='home' else PRODUCT_PLACEMENTS[placement]
+        lines=[f'🛍 {title}','',f'💵 可用积分：{a}']
         if f: lines.append(f'冻结积分：{f}')
-        lines += ['', '请选择需要的服务' if products else '暂无上架服务']
+        empty='暂无上架服务' if placement=='home' else '暂无项目'
+        lines += ['', '请选择需要的服务' if products else empty]
         if pages>1: lines.append(f'第 {page+1} / {pages} 页')
         text='\n'.join(lines)
         entities=ui_entities(text)
@@ -191,13 +199,16 @@ class App(PaymentUI,AdminUI):
     def callback(self,u,data,message_id=None):
         bits=data.split(':'); action=bits[0]; args=bits[1:]
         admin_actions={'admin','database','catalog','newproduct','manage','editproduct','saveproduct','pfieldkind','paddfield','pfieldsdone','pkeepfields','move','toggle','pending','order','batch','bulk','bulkyes','receipts','delreceipt','finish','sendreceipt','refund','refundyes','adjust','adjustyes','exceptions','opshelp'}
-        if action in admin_actions: self.s.admin(u)
+        if action in admin_actions or action=='pplacement': self.s.admin(u)
         state=self.s.session(u)
         if action in ('catalog','manage','pending','batch','order','receipts'):
             self.s.set_session(u,{})
         if action=='home':
             self.s.set_session(u,{})
             self.home(u,int(args[0]) if args else 0,message_id=message_id if args else None)
+        elif action=='region':
+            self.s.set_session(u,{})
+            self.home(u,int(args[0]) if args else 0,message_id=message_id,placement='region')
         elif action=='admin': self.s.set_session(u,{}); self.admin_home(u)
         elif action=='database': self.retention_status(u)
         elif action=='adjust':
@@ -319,20 +330,42 @@ class App(PaymentUI,AdminUI):
             self.send(u,'\n'.join(lines),rows)
             for item in attachments: self.send_payload(u,item)
         elif action=='catalog':
-            self.send(u,'全部商品',[[((p['name']+'（上架）' if p['active'] else p['name']+'（下架）'),'manage:'+str(p['id']))] for p in self.s.products(True)]+[[('新增','newproduct')]])
+            placement=args[0] if args else 'home'
+            if placement not in PRODUCT_PLACEMENTS: raise DomainError('商品展示位置无效。')
+            self.catalog_view(u,placement,int(args[1]) if len(args)>1 else 0,message_id)
         elif action=='manage':
-            p=self.s.product(int(args[0])); self.send(u,self.product_text(p),[[('修改','editproduct:'+args[0]),('上架/下架','toggle:'+args[0])],[('上移','move:'+args[0]+':-1'),('下移','move:'+args[0]+':1')]])
+            p=self.s.product(int(args[0]))
+            placement=p['placement']
+            status='上架' if p['active'] else '下架'
+            self.send(u,f'{PRODUCT_PLACEMENTS[placement]} · {status}\n'+self.product_text(p),[
+                [('修改','editproduct:'+args[0]),('下架' if p['active'] else '上架','toggle:'+args[0])],
+                [('上移','move:'+args[0]+':-1'),('下移','move:'+args[0]+':1')],
+                [('返回商品管理','catalog:'+placement)],
+            ])
         elif action=='toggle':
-            p=self.s.product(int(args[0])); p['active']=1-p['active']; self.s.save_product(u,p); self.callback(u,'catalog')
-        elif action=='move': self.s.move_product(u,int(args[0]),int(args[1])); self.callback(u,'catalog')
+            p=self.s.product(int(args[0])); p['active']=1-p['active']; self.s.save_product(u,p); self.callback(u,'catalog:'+p['placement'])
+        elif action=='move':
+            pid=int(args[0])
+            self.s.move_product(u,pid,int(args[1]))
+            self.callback(u,'catalog:'+self.s.product(pid)['placement'])
         elif action in ('newproduct','editproduct'):
-            p=self.s.product(int(args[0])) if args else {}
+            editing=action=='editproduct'
+            placement=args[0] if args and not editing else 'home'
+            if placement not in PRODUCT_PLACEMENTS: raise DomainError('商品展示位置无效。')
+            p=self.s.product(int(args[0])) if editing else {'placement':placement}
             self.s.set_session(u,{'mode':'product','step':0,'product':p})
-            self.send(u,'请输入商品名称。'+(' 修改时可发送「保留」。' if p else ''),[[('取消','admin')]])
-        elif action=='saveproduct':
+            self.send(u,'请输入商品名称。'+(' 修改时可发送「保留」。' if editing else ''),[[('取消','admin')]])
+        elif action in ('saveproduct','pplacement'):
             if state.get('mode')!='product_preview' or not args or state.get('key')!=args[0]:
                 raise DomainError('商品预览已失效，请使用最新的确认按钮。')
-            self.s.save_product(u,state['product']); self.s.set_session(u,{}); self.callback(u,'catalog')
+            product=state['product']
+            if action=='pplacement':
+                if len(args)!=2 or args[1] not in PRODUCT_PLACEMENTS: raise DomainError('商品展示位置无效。')
+                product['placement']=args[1]
+                self.product_preview(u,state,message_id=message_id)
+            else:
+                pid=self.s.save_product(u,product)
+                self.callback(u,'catalog:'+self.s.product(pid)['placement'])
         elif action in ('pfieldkind','paddfield','pfieldsdone','pkeepfields'):
             if not args or state.get('key')!=args[0]:
                 raise DomainError('这个按钮已失效，请使用最新提示。')
@@ -452,14 +485,36 @@ class App(PaymentUI,AdminUI):
         else:
             buttons.insert(0,('批量回单','bulk:'+batch))
         return '\n'.join(details),[buttons]
+    def catalog_view(self,u,placement,page=0,message_id=None):
+        products=self.s.products(all_items=True,placement=placement)
+        pages=max(1,(len(products)+7)//8)
+        page=max(0,min(page,pages-1))
+        rows=[]
+        for product in products[page*8:(page+1)*8]:
+            status='上架' if product['active'] else '下架'
+            rows.append([(f"{product['name']}（{status}）",f"manage:{product['id']}")])
+        navigation=[]
+        if page: navigation.append(('上一页',f'catalog:{placement}:{page-1}'))
+        if page+1<pages: navigation.append(('下一页',f'catalog:{placement}:{page+1}'))
+        if navigation: rows.append(navigation)
+        rows.append([(name,f'catalog:{key}') for key,name in PRODUCT_PLACEMENTS.items() if key!=placement])
+        rows.append([('新增商品',f'newproduct:{placement}'),('返回后台','admin')])
+        title=f'商品管理 · {PRODUCT_PLACEMENTS[placement]}'
+        if not products: title+='\n暂无项目'
+        if pages>1: title+=f'\n第 {page+1} / {pages} 页'
+        self.card(u,title,rows,message_id=message_id)
+
     def product_text(self,p):
         return f"{p.get('name','')}\n{p.get('price','')} 积分 / 单 · 预计 {p.get('eta','')}\n{p.get('description','')}\n提交资料："+'、'.join(f["name"]+'（'+FIELD_TYPES[f["kind"]]+'）' for f in p.get('fields',[]))
-    def product_preview(self,u,state):
+    def product_preview(self,u,state,message_id=None):
         state.update(mode='product_preview',key=uid())
         self.s.set_session(u,state)
-        self.send(u,'商品预览\n'+self.product_text(state['product']),[
+        product=state['product']
+        placement=product.get('placement','home')
+        self.card(u,f'商品预览 · {PRODUCT_PLACEMENTS[placement]}\n'+self.product_text(product),[
+            [(f'移到{name}',f"pplacement:{state['key']}:{key}") for key,name in PRODUCT_PLACEMENTS.items() if key!=placement],
             [('确认保存','saveproduct:'+state['key']),('取消','admin')],
-        ])
+        ],message_id=message_id)
     def product_fields_view(self,u,state):
         fields=state['product']['fields']
         lines=[f'{i}. {f["name"]} · {FIELD_TYPES[f["kind"]]}' for i,f in enumerate(fields,1)]

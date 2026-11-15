@@ -88,26 +88,36 @@ class Store:
             if self.money(c,user,amount,0,'adjust:'+key,'管理员调整／其他收款',reason): self.audit(c,actor,'adjust',user,dump({'amount':amount,'reason':reason}))
     def product(self,pid):
         p=self.one('SELECT * FROM products WHERE id=?',(pid,)); p['fields']=json.loads(p['fields']); return p
-    def products(self,all_items=False):
-        return [self.product(r['id']) for r in self.rows('SELECT id FROM products '+('' if all_items else 'WHERE active=1 ')+'ORDER BY position,id')]
+    def products(self,all_items=False,placement=None):
+        products=self.rows(
+            'SELECT * FROM products WHERE (? OR active=1) AND (? IS NULL OR placement=?) ORDER BY position,id',
+            (all_items,placement,placement),
+        )
+        for product in products:
+            product['fields']=json.loads(product['fields'])
+        return products
     def save_product(self,actor,p):
         self.admin(actor)
         if not p['name'].strip() or type(p['price'])!=int or p['price']<1: raise DomainError('名称与正整数价格必填')
         fields=p['fields']
         if not fields or len(fields)>10 or any(not f['name'].strip() or f['kind'] not in ('text','photo','document') for f in fields): raise DomainError('字段配置无效（1至10项）')
         with self.tx() as c:
+            placement=p.get('placement')
+            if placement is not None and placement not in ('home','region'):
+                raise DomainError('商品展示位置无效。')
             values=(p['name'],p['price'],p['description'],p['eta'],dump(fields),int(p.get('active',1)))
             if p.get('id'):
-                pid=p['id']; c.execute('UPDATE products SET name=?,price=?,description=?,eta=?,fields=?,active=?,revision=revision+1 WHERE id=?',values+(pid,))
+                pid=p['id']
+                c.execute('UPDATE products SET name=?,price=?,description=?,eta=?,fields=?,active=?,placement=COALESCE(?,placement),revision=revision+1 WHERE id=?',values+(placement,pid))
             else:
                 pos=c.execute('SELECT COALESCE(MAX(position),0)+1 FROM products').fetchone()[0]
-                pid=c.execute('INSERT INTO products(name,price,description,eta,fields,active,position) VALUES(?,?,?,?,?,?,?)',values+(pos,)).lastrowid
+                pid=c.execute('INSERT INTO products(name,price,description,eta,fields,active,position,placement) VALUES(?,?,?,?,?,?,?,?)',values+(pos,placement or 'home')).lastrowid
             self.audit(c,actor,'product',pid,dump(p))
             return pid
     def move_product(self,actor,pid,direction):
         self.admin(actor)
         with self.tx() as c:
-            items=c.execute('SELECT id,position FROM products ORDER BY position,id').fetchall()
+            items=c.execute('SELECT id,position FROM products WHERE placement=(SELECT placement FROM products WHERE id=?) ORDER BY position,id',(pid,)).fetchall()
             i=next(i for i,p in enumerate(items) if p['id']==pid); j=i+direction
             if 0<=j<len(items):
                 c.execute('UPDATE products SET position=? WHERE id=?',(items[j]['position'],pid))

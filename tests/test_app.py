@@ -73,9 +73,35 @@ class AppTests(Fixture, unittest.TestCase):
         self.msg('/start')
         card=self.t.calls[-1][1]
         self.assertIn('暂无上架服务',card['text'])
-        self.assertEqual(1,len(card['reply_markup']['inline_keyboard']))
+        self.assertEqual(['地区神父','充值积分'],[row[0]['text'] for row in card['reply_markup']['inline_keyboard']])
         self.msg('/start',99)
         self.assertEqual('admin',self.t.calls[-1][1]['reply_markup']['inline_keyboard'][-1][0]['callback_data'])
+    def test_region_catalog_admin_and_customer(self):
+        self.click('catalog:region',99)
+        self.assertIn('暂无项目',self.t.calls[-1][1]['text'])
+        self.click('newproduct:region',99)
+        for value in ('地区项目','7','项目说明','2 小时','资料'):
+            self.msg(value,99)
+        key=self.s.session(99)['key']
+        self.click(f'pfieldkind:{key}:text',99)
+        key=self.s.session(99)['key']
+        self.click(f'pfieldsdone:{key}',99)
+        key=self.s.session(99)['key']
+        self.click(f'saveproduct:{key}',99)
+        product,=self.s.products(placement='region')
+        self.assertEqual(7,product['price'])
+        buy=f"buy:{product['id']}"
+        self.msg('/start')
+        home=self.t.calls[-1][1]['reply_markup']['inline_keyboard']
+        self.assertIn(f'buy:{self.p}',str(home))
+        self.assertNotIn(buy,str(home))
+        self.click('region')
+        self.assertIn(buy,str(self.t.calls[-1][1]['reply_markup']))
+        self.click(f"toggle:{product['id']}",99)
+        self.click('region')
+        self.assertIn('暂无项目',self.t.calls[-1][1]['text'])
+        self.click(buy)
+        self.assertIn('已下架',self.t.calls[-1][1]['text'])
     def test_home_custom_emoji_rejection_falls_back_but_timeout_does_not_retry(self):
         with patch.object(self.t,'call',side_effect=[TelegramRejected(400,reason='custom_emoji'),{'message_id':1},{'message_id':2}]) as call:
             self.app.home(1)
