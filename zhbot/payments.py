@@ -1,16 +1,24 @@
 """Local payment ownership and atomic point accounting; gateway verifies evidence."""
 from decimal import Decimal, InvalidOperation
+from threading import Lock
 from urllib.parse import urlparse
-from .store import DomainError, uid
+from .store import DomainError, dump, uid
 
 
 class PaymentUnavailable(DomainError):
     pass
 
 
+class PaymentCreationUncertain(PaymentUnavailable):
+    def __init__(self, order_id):
+        self.order_id = order_id
+        super().__init__('原充值单 '+order_id+' 创建结果待核实，请检查支付状态')
+
+
 class Payments:
     def __init__(self, store, gateway, merchant):
         self.s, self.gateway, self.merchant = store, gateway, merchant
+        self._creating = Lock()
 
     def recent(self, user, page=0):
         if type(page) is not int or page < 0 or page > 100000: raise DomainError('页码无效')
@@ -25,6 +33,10 @@ class Payments:
             raise PaymentUnavailable('OKPay 尚未配置，未开放充值')
         if type(amount) != int or amount < 1 or amount > 1_000_000_000:
             raise DomainError('充值仅支持 1 至 1000000000 整数 USDT')
+        with self._creating:
+            return self._create(user, amount)
+
+    def _create(self, user, amount):
         order = {'id': uid(), 'user_id': user, 'amount': amount,
                  'currency': 'USDT', 'merchant': self.merchant}
         with self.s.tx() as c:
@@ -33,7 +45,7 @@ class Payments:
             if existing:
                 if existing['url'] and existing['state'] == 'pending':
                     return dict(existing)
-                raise PaymentUnavailable('原充值单 '+existing['id']+' 创建结果待核实，请检查其支付状态，勿重复创建')
+                raise PaymentCreationUncertain(existing['id'])
             c.execute('INSERT INTO payments(id,user_id,amount,merchant) VALUES(?,?,?,?)',
                       (order['id'], user, amount, self.merchant))
         try:
@@ -49,16 +61,16 @@ class Payments:
                 used = c.execute('SELECT id FROM payments WHERE platform_id=? AND id!=?', (platform, order['id'])).fetchone()
                 if used:
                     raise PaymentUnavailable('平台单号已绑定其他充值订单')
-                # A concurrent check may already have credited this order.
-                c.execute("UPDATE payments SET url=?,platform_id=?,state=CASE WHEN state='credited' THEN state ELSE 'pending' END WHERE id=?",
+                # Preserve a terminal state if it changed during the request.
+                c.execute("UPDATE payments SET url=?,platform_id=?,state=CASE WHEN state IN ('credited','closed') THEN state ELSE 'pending' END WHERE id=?",
                           (result['url'], platform, order['id']))
                 self._record(c, order['id'], 'created', platform, result.get('verification_hash', ''))
             return dict(order, url=result['url'], platform_id=platform)
         except Exception:
             with self.s.tx() as c:
-                c.execute("UPDATE payments SET state='uncertain' WHERE id=? AND state!='credited'", (order['id'],))
+                c.execute("UPDATE payments SET state='uncertain' WHERE id=? AND state NOT IN ('credited','closed')", (order['id'],))
                 self._record(c, order['id'], 'create_uncertain')
-            raise PaymentUnavailable('创建支付链接未确认，原充值单 '+order['id']+' 可在充值菜单检查状态；未增加积分') from None
+            raise PaymentCreationUncertain(order['id']) from None
 
     def attach_link(self, actor, pid, platform, url, reason):
         self.s.admin(actor)
@@ -77,6 +89,33 @@ class Payments:
             # Never confirm payment or change the customer's balance here.
             self.s.audit(c, actor, 'payment_link', pid, reason)
             self._record(c, pid, 'link_restored_by_admin', platform)
+
+    def close_unpaid(self, actor, pid, disposition, reason):
+        self.s.admin(actor)
+        if disposition not in ('absent', 'closed') or not reason.strip():
+            raise DomainError('请注明商户核实结论及凭据：absent 或 closed')
+        # In the single polling instance, creation may be in flight even when
+        # the merchant cannot yet find the order. Require fresh confirmation later.
+        if not self._creating.acquire(blocking=False):
+            raise DomainError('有充值单正在创建，请等建单结束后重新核实')
+        try:
+            with self.s.tx() as c:
+                order = c.execute('SELECT * FROM payments WHERE id=?', (pid,)).fetchone()
+                if not order or order['merchant'] != self.merchant:
+                    raise DomainError('本地充值单不存在或商户不匹配')
+                if order['state'] == 'closed':
+                    return
+                if order['state'] not in ('created', 'pending', 'uncertain'):
+                    raise DomainError('仅未入账的充值单允许关闭')
+                if disposition == 'absent' and (order['platform_id'] or order['url']):
+                    raise DomainError('原单有建单记录，请核实已永久关闭且未付款')
+                c.execute("UPDATE payments SET state='closed' WHERE id=?", (pid,))
+                self.s.audit(c, actor, 'payment_close', pid, dump({
+                    'disposition': disposition, 'reason': reason.strip(),
+                }))
+                self._record(c, pid, 'closed_by_admin', order['platform_id'])
+        finally:
+            self._creating.release()
 
     def check(self, user, pid):
         if not self.gateway:
@@ -110,6 +149,9 @@ class Payments:
                 used = c.execute('SELECT id FROM payments WHERE platform_id=? AND id!=?', (platform, pid)).fetchone()
                 if used:
                     raise DomainError('平台交易已用于其他充值')
+                if current['state'] == 'closed' and not evidence['paid']:
+                    self._record(c, pid, 'closed_query_unpaid', platform, evidence.get('verification_hash', ''))
+                    return '原充值单已关闭，请勿使用原链接'
                 state = 'credited' if evidence['paid'] else 'pending'
                 c.execute('UPDATE payments SET state=?,platform_id=? WHERE id=?', (state, platform, pid))
                 if evidence['paid']:

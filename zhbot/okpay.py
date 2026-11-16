@@ -70,7 +70,8 @@ class OKPayGateway:
         request = Request(self.BASE + '/' + endpoint,
                           data=urlencode(signed).encode('utf-8'), method='POST',
                           headers={'Content-Type': 'application/x-www-form-urlencoded',
-                                   'Accept': 'application/json'})
+                                   'Accept': 'application/json',
+                                   'User-Agent': 'zhbot/1.0'})
         try:
             with self.opener(request, timeout=20) as response:
                 if getattr(response, 'status', 200) != 200:

@@ -1,0 +1,1 @@
+ALTER TABLE receipts ADD COLUMN context INTEGER NOT NULL DEFAULT 0 CHECK (context IN (0,1));

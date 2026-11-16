@@ -35,6 +35,18 @@ class SafetyTests(Fixture,unittest.TestCase):
         self.s.set_field(1,d,1,{'kind':'photo','file_id':'new'})
         b=self.s.confirm(1,d); self.assertEqual(1,len(self.s.orders(b)))
         restart=Store(self.s.path,99); self.assertEqual((7,3),restart.balance(1))
+    def test_stale_attachment_delete_preserves_next_attachment(self):
+        p=self.s.product(self.p)
+        p['fields']=[{'name':'图片','kind':'photo'}]
+        self.s.save_product(99,p)
+        draft=self.s.new_draft(1,self.p)
+        for file_id in ('first','second'):
+            self.s.set_field(1,draft,0,{'kind':'photo','file_id':file_id})
+        version=self.s.draft(1,draft)['edit_version']
+        self.s.set_field(1,draft,0,{},delete=0,expected_version=version)
+        with self.assertRaises(DomainError):
+            self.s.set_field(1,draft,0,{},delete=0,expected_version=version)
+        self.assertEqual('second',self.s.draft(1,draft)['data']['0'][0]['file_id'])
     def test_nonempty_cannot_refund_as_empty(self):
         o=self.s.orders(self.s.confirm(1,self.draft('x')))[0]['id']
         self.s.add_receipt(99,o,{'kind':'text','text':'r'})

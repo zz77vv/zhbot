@@ -1,0 +1,18 @@
+[Unit]
+Description=ZHBot comprehensive order bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/zhbot
+EnvironmentFile=/root/zhbot/.env
+ExecStart=/root/zhbot/.venv/bin/python -u -m zhbot run
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
