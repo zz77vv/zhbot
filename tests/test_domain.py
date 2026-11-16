@@ -17,6 +17,29 @@ class Fixture:
         return d
 
 class DomainTests(Fixture, unittest.TestCase):
+    def test_secondary_quote_is_per_order_and_expiration_refunds_once(self):
+        self.s.set_product_tiers(99,self.p,self.s.product(self.p)['revision'],{'新菜':3,'大众名':4,'剩菜':12})
+        batch=self.s.confirm(1,self.draft())
+        first,second=self.s.orders(batch)
+        oid=first['id']
+        self.s.offer_quote(99,oid,'大众名')
+        original=self.s.open_quote(oid)
+        self.assertEqual(4,original['price'])
+        with self.assertRaises(DomainError):
+            self.s.queue_bulk(99,batch,{'a':'ok','b':'ok'})
+        with self.assertRaises(DomainError):
+            self.s.add_receipt(99,oid,{'kind':'text','text':'done'})
+        self.s.offer_quote(99,oid,'剩菜')
+        with self.assertRaises(DomainError):
+            self.s.resolve_quote(1,original['id'],True)
+        with self.s.tx() as c:
+            c.execute("UPDATE order_quotes SET expires_at='2000-01-01 00:00:00' WHERE state='pending'")
+        self.s.expire_quotes()
+        self.s.expire_quotes()
+        self.assertEqual('cancel',self.s.order(oid)['status'])
+        self.assertEqual('pending',self.s.order(second['id'])['status'])
+        self.assertEqual((7,3),self.s.balance(1))
+
     def test_batch_idempotent_freeze(self):
         d=self.draft(); b=self.s.confirm(1,d)
         self.assertEqual(b,self.s.confirm(1,d))

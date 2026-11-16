@@ -7,6 +7,16 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+LEGACY_TIERS = {
+    'owner': {'新菜': 1, '大众名': 2, '剩菜': 12},
+    'secondary': {'新菜': 3, '大众名': 4, '剩菜': 12},
+}
+
+def product_tiers(product):
+    if 'tiers' in product:
+        return json.loads(product['tiers'])
+    return LEGACY_TIERS.get(product.get('price_profile'), {})
+
 class DomainError(ValueError):
     pass
 
@@ -105,7 +115,10 @@ class Store:
             placement=p.get('placement')
             if placement is not None and placement not in ('home','region'):
                 raise DomainError('商品展示位置无效。')
-            values=(p['name'],p['price'],p['description'],p['eta'],dump(fields),int(p.get('active',1)))
+            existing=c.execute('SELECT tiers FROM products WHERE id=?',(p.get('id'),)).fetchone()
+            tiers=json.loads(existing['tiers']) if existing else {}
+            price=min(tiers.values()) if tiers else p['price']
+            values=(p['name'],price,p['description'],p['eta'],dump(fields),int(p.get('active',1)))
             if p.get('id'):
                 pid=p['id']
                 c.execute('UPDATE products SET name=?,price=?,description=?,eta=?,fields=?,active=?,placement=COALESCE(?,placement),revision=revision+1 WHERE id=?',values+(placement,pid))
@@ -114,6 +127,20 @@ class Store:
                 pid=c.execute('INSERT INTO products(name,price,description,eta,fields,active,position,placement) VALUES(?,?,?,?,?,?,?,?)',values+(pos,placement or 'home')).lastrowid
             self.audit(c,actor,'product',pid,dump(p))
             return pid
+    def set_product_tiers(self,actor,pid,revision,tiers):
+        self.admin(actor)
+        if (len(tiers)>10 or len(set(tiers.values()))!=len(tiers)
+                or any(not name.strip() or len(name)>30 or type(price)!=int or not 1<=price<=10**9
+                       for name,price in tiers.items())):
+            raise DomainError('最多 10 档，名称 1 至 30 字，价格须为不同的正整数。')
+        with self.tx() as c:
+            row=c.execute('SELECT price,revision FROM products WHERE id=?',(pid,)).fetchone()
+            if not row or row['revision']!=revision:
+                raise DomainError('商品已更新，请重新打开档位设置。')
+            price=min(tiers.values()) if tiers else row['price']
+            c.execute('UPDATE products SET tiers=?,price=?,price_profile=NULL,revision=revision+1 WHERE id=?',
+                      (dump(tiers),price,pid))
+            self.audit(c,actor,'product_tiers',pid,dump(tiers))
     def move_product(self,actor,pid,direction):
         self.admin(actor)
         with self.tx() as c:
@@ -123,12 +150,17 @@ class Store:
                 c.execute('UPDATE products SET position=? WHERE id=?',(items[j]['position'],pid))
                 c.execute('UPDATE products SET position=? WHERE id=?',(items[i]['position'],items[j]['id']))
             self.audit(c,actor,'move',pid,str(direction))
-    def new_draft(self,user,pid):
+    def new_draft(self,user,pid,*,tier_price=None,expected_revision=None):
         with self.tx() as c:
             p=c.execute('SELECT * FROM products WHERE id=? AND active=1',(pid,)).fetchone()
             if not p: raise DomainError('商品已下架')
+            if tier_price is not None and (expected_revision!=p['revision'] or tier_price not in product_tiers(dict(p)).values()):
+                raise DomainError('档位已更新，请重新打开商品选择。')
             c.execute("UPDATE drafts SET status='abandoned' WHERE user_id=? AND status='editing'",(user,))
-            d=uid(); c.execute('INSERT INTO drafts(id,user_id,product_id,revision) VALUES(?,?,?,?)',(d,user,pid,p['revision'])); return d
+            d=uid()
+            c.execute('INSERT INTO drafts(id,user_id,product_id,revision,tier_price) VALUES(?,?,?,?,?)',
+                      (d,user,pid,p['revision'],tier_price))
+            return d
     def draft(self,user,d):
         r=self.one('SELECT * FROM drafts WHERE id=? AND user_id=?',(d,user)); r['data']=json.loads(r['data']); return r
     def set_field(self,user,d,index,payload,delete=None,expected_version=None):
@@ -171,7 +203,8 @@ class Store:
             if expected_version is not None and r['edit_version']!=expected_version: raise DomainError('草稿已修改，请使用最新预览确认')
             p=self.product(r['product_id'])
             if not p['active'] or p['revision']!=r['revision']: raise DomainError('商品已变更，请重新选择')
-            subs=self.submissions(dict(r,data=json.loads(r['data'])),p); total=len(subs)*p['price']
+            price=r['tier_price'] if r['tier_price'] is not None else p['price']
+            subs=self.submissions(dict(r,data=json.loads(r['data'])),p); total=len(subs)*price
             available=self.balance(user)[0]
             if available<total:
                 c.execute('UPDATE drafts SET edit_version=edit_version+1 WHERE id=?',(d,))
@@ -179,8 +212,8 @@ class Store:
             else:
                 batch=uid(); c.execute('INSERT INTO batches(id,user_id) VALUES(?,?)',(batch,user))
                 for sub in subs:
-                    o=uid(); c.execute('INSERT INTO orders(id,batch_id,user_id,price,snapshot,submission) VALUES(?,?,?,?,?,?)',(o,batch,user,p['price'],dump(p),dump(sub)))
-                    self.money(c,user,-p['price'],p['price'],'freeze:'+o,'订单冻结')
+                    o=uid(); c.execute('INSERT INTO orders(id,batch_id,user_id,price,snapshot,submission) VALUES(?,?,?,?,?,?)',(o,batch,user,price,dump(p),dump(sub)))
+                    self.money(c,user,-price,price,'freeze:'+o,'订单冻结')
                 c.execute("UPDATE drafts SET status='submitted',batch_id=? WHERE id=?",(batch,d))
                 self.event(c,'new:'+batch,'new',self.admin_id,{'batch':batch})
         if error: raise error
@@ -188,6 +221,69 @@ class Store:
     def orders(self,batch=None):
         return self.rows('SELECT * FROM orders'+(' WHERE batch_id=?' if batch else '')+' ORDER BY rowid',(batch,) if batch else ())
     def order(self,o): return self.one('SELECT * FROM orders WHERE id=?',(o,))
+    def open_quote(self,order_id):
+        rows=self.rows("SELECT * FROM order_quotes WHERE order_id=? AND state='pending'",(order_id,))
+        return rows[0] if rows else None
+    def offer_quote(self,actor,order_id,tier):
+        self.admin(actor)
+        with self.tx() as c:
+            order=self.require_pending(c,order_id,allow_quote=True)
+            tiers=product_tiers(json.loads(order['snapshot']))
+            price=tiers.get(tier)
+            if price is None or price<=order['price']:
+                raise DomainError('请选择高于当前价格的档位。')
+            if c.execute('SELECT 1 FROM receipts WHERE order_id=?',(order_id,)).fetchone():
+                raise DomainError('请先删除暂存回单，再发起补差价。')
+            existing=c.execute(
+                "SELECT *,expires_at<=CURRENT_TIMESTAMP AS expired FROM order_quotes WHERE order_id=? AND state='pending'",
+                (order_id,),
+            ).fetchone()
+            if existing and existing['expired']:
+                raise DomainError('原报价已超时，订单将自动取消退款。')
+            if existing and existing['tier']==tier:
+                return
+            c.execute("UPDATE order_quotes SET state='replaced' WHERE order_id=? AND state='pending'",(order_id,))
+            quote_id=uid()
+            c.execute("INSERT INTO order_quotes(id,order_id,price,tier,expires_at) VALUES(?,?,?,?,datetime('now','+24 hours'))",
+                      (quote_id,order_id,price,tier))
+            self.audit(c,actor,'quote',order_id,dump({'quote':quote_id,'price':price,'tier':tier}))
+            self.event(c,'quote:'+quote_id,'quote',order['user_id'],{'order':order_id,'quote':quote_id})
+    def resolve_quote(self,user,quote_id,accept):
+        with self.tx() as c:
+            quote=c.execute('SELECT * FROM order_quotes WHERE id=?',(quote_id,)).fetchone()
+            if not quote:
+                raise DomainError('报价不存在。')
+            order=self.require_pending(c,quote['order_id'],allow_quote=True)
+            if order['user_id']!=user or quote['state']!='pending':
+                raise DomainError('报价已失效或不属于你。')
+            if c.execute('SELECT ?<=CURRENT_TIMESTAMP',(quote['expires_at'],)).fetchone()[0]:
+                self._close_quote(c,order,quote,'expired')
+                return 'expired'
+            if not accept:
+                self._close_quote(c,order,quote,'declined')
+                return 'declined'
+            delta=quote['price']-order['price']
+            wallet=c.execute('SELECT available FROM wallets WHERE user_id=?',(user,)).fetchone()
+            available=wallet['available'] if wallet else 0
+            if available<delta:
+                raise InsufficientPoints(delta-available)
+            self.money(c,user,-delta,delta,'quote_accept:'+quote_id,'订单补差价')
+            c.execute('UPDATE orders SET price=? WHERE id=?',(quote['price'],order['id']))
+            c.execute("UPDATE order_quotes SET state='accepted' WHERE id=?",(quote_id,))
+            self.audit(c,user,'quote_accepted',order['id'],quote_id)
+            self.event(c,'quote_accepted:'+quote_id,'quote_accepted',self.admin_id,
+                       {'order':order['id'],'price':quote['price'],'tier':quote['tier']})
+            return 'accepted'
+    def expire_quotes(self):
+        with self.tx() as c:
+            quotes=c.execute("SELECT * FROM order_quotes WHERE state='pending' AND expires_at<=CURRENT_TIMESTAMP ORDER BY expires_at LIMIT 100").fetchall()
+            for quote in quotes:
+                order=self.require_pending(c,quote['order_id'],allow_quote=True)
+                self._close_quote(c,order,quote,'expired')
+    def _close_quote(self,c,order,quote,state):
+        reason='补差价报价已超时' if state=='expired' else '客户拒绝补差价'
+        c.execute('UPDATE order_quotes SET state=? WHERE id=?',(state,quote['id']))
+        self._refund_pending(c,order,order['user_id'],'cancel',reason,source='补差价取消')
     def receipts(self,o): return self.rows('SELECT * FROM receipts WHERE order_id=? ORDER BY id',(o,))
     def bulk_rows(self,actor,batch):
         self.admin(actor)
@@ -195,10 +291,11 @@ class Store:
             return self._bulk_rows(c,batch)
     def _bulk_rows(self,c,batch):
         orders=c.execute(
-            "SELECT o.*, EXISTS(SELECT 1 FROM receipts WHERE order_id=o.id) AS has_receipt "
+            "SELECT o.*, EXISTS(SELECT 1 FROM receipts WHERE order_id=o.id) AS has_receipt, "
+            "EXISTS(SELECT 1 FROM order_quotes WHERE order_id=o.id AND state='pending') AS has_quote "
             "FROM orders o WHERE o.batch_id=? ORDER BY o.rowid",(batch,)
         ).fetchall()
-        if len(orders)<2 or any(o['status']!='pending' or o['has_receipt'] for o in orders):
+        if len(orders)<2 or any(o['status']!='pending' or o['has_receipt'] or o['has_quote'] for o in orders):
             raise DomainError('仅全批待处理且未暂存回单时可批量回单。')
         rows={}
         for o in orders:
@@ -256,9 +353,11 @@ class Store:
             self.require_pending(c,o)
             c.execute('INSERT INTO receipts(order_id,payload) VALUES(?,?)',(o,dump(payload)))
             self.audit(c,actor,'receipt_add',o)
-    def require_pending(self,c,o):
+    def require_pending(self,c,o,*,allow_quote=False):
         r=c.execute('SELECT * FROM orders WHERE id=?',(o,)).fetchone()
         if not r or r['status']!='pending': raise DomainError('订单已锁定或已结束')
+        if not allow_quote and c.execute("SELECT 1 FROM order_quotes WHERE order_id=? AND state='pending'",(o,)).fetchone():
+            raise DomainError('订单正在等待客户确认补差价。')
         return r
     def delete_receipt(self,actor,o,rid):
         self.admin(actor)
@@ -329,9 +428,16 @@ class Store:
             else:
                 r=self.require_pending(c,o)
             if kind=='empty' and c.execute('SELECT 1 FROM receipts WHERE order_id=?',(o,)).fetchone(): raise DomainError('有回单不可按空单退款')
-            self.money(c,r['user_id'],r['price'],-r['price'],'refund:'+o,'空单退款' if kind=='empty' else '管理员取消',reason)
-            c.execute('UPDATE orders SET status=?,reason=? WHERE id=?',(kind,reason,o)); self.audit(c,actor,kind,o,reason)
-            self.event(c,'refund:'+o,'refund',r['user_id'],{'order':o,'points':r['price'],'reason':reason}); self.summary(c,r['batch_id'])
+            self._refund_pending(c,r,actor,kind,reason)
+    def _refund_pending(self,c,order,actor,kind,reason,*,source=None):
+        order_id=order['id']
+        source=source or ('空单退款' if kind=='empty' else '管理员取消')
+        self.money(c,order['user_id'],order['price'],-order['price'],'refund:'+order_id,source,reason)
+        c.execute('UPDATE orders SET status=?,reason=? WHERE id=?',(kind,reason,order_id))
+        self.audit(c,actor,kind,order_id,reason)
+        self.event(c,'refund:'+order_id,'refund',order['user_id'],
+                   {'order':order_id,'points':order['price'],'reason':reason})
+        self.summary(c,order['batch_id'])
     def summary(self,c,b):
         rows=c.execute('SELECT * FROM orders WHERE batch_id=?',(b,)).fetchall()
         if any(r['status'] not in ('completed','empty','cancel') for r in rows): return

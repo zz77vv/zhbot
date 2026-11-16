@@ -1,6 +1,6 @@
 """Private-chat Telegram UI; domain authorization is also enforced in Store."""
 import json
-from .store import DomainError, InsufficientPoints, uid
+from .store import DomainError, InsufficientPoints, product_tiers, uid
 from .telegram import TelegramRejected
 from .payment_ui import PaymentUI
 from .admin_ui import AdminUI
@@ -199,7 +199,7 @@ class App(PaymentUI,AdminUI):
     def callback(self,u,data,message_id=None):
         bits=data.split(':'); action=bits[0]; args=bits[1:]
         admin_actions={'admin','database','catalog','newproduct','manage','editproduct','saveproduct','pfieldkind','paddfield','pfieldsdone','pkeepfields','move','toggle','pending','order','batch','bulk','bulkyes','receipts','delreceipt','finish','sendreceipt','refund','refundyes','adjust','adjustyes','exceptions','opshelp'}
-        if action in admin_actions or action=='pplacement': self.s.admin(u)
+        if action in admin_actions or action in ('pplacement','pprofile','psavetiers','quote','qoffer'): self.s.admin(u)
         state=self.s.session(u)
         if action in ('catalog','manage','pending','batch','order','receipts'):
             self.s.set_session(u,{})
@@ -216,9 +216,23 @@ class App(PaymentUI,AdminUI):
             self.send(u,'请输入客户的 Telegram 数字 ID。',[[('取消','admin')]])
         elif action=='opshelp':
             self.send(u,'核实后再操作\n\n已送达回单\n/resolve 回单ID sent 消息ID 核实证据\n\n确认未送达回单\n/resolve 回单ID retry 0 核实证据\n\n恢复已核实订单\n/resume 订单ID 核实证据\n\n通知核实\n/event 事件ID sent 消息ID\n/event 事件ID retry 0',[[('返回异常处理','exceptions')]])
-        elif action=='buy':
-            p=self.s.product(int(args[0])); d=self.s.new_draft(u,p['id']); self.s.set_session(u,{'mode':'draft','draft':d,'field':0})
-            self.draft_view(u,d,show_product=True)
+        elif action in ('buy','buytier'):
+            p=self.s.product(int(args[0]))
+            if not p['active']: raise DomainError('商品已下架')
+            tiers=product_tiers(p)
+            if action=='buy' and tiers:
+                rows=[[(f'{name} · {price}U',f'buytier:{p["id"]}:{p["revision"]}:{price}')]
+                      for name,price in sorted(tiers.items(),key=lambda pair:pair[1])]
+                back='region' if p['placement']=='region' else 'home:0'
+                rows.append([('返回',back)])
+                self.card(u,'\n'.join(filter(None,(p['name'],p['description'],f"预计 {p['eta']}",'请选择档位'))),
+                          rows,message_id=message_id)
+            else:
+                selected=int(args[2]) if action=='buytier' else None
+                revision=int(args[1]) if action=='buytier' else None
+                d=self.s.new_draft(u,p['id'],tier_price=selected,expected_revision=revision)
+                self.s.set_session(u,{'mode':'draft','draft':d,'field':0})
+                self.draft_view(u,d,show_product=True)
         elif action=='field':
             d=args[0]
             if self.s.draft(u,d)['status']!='editing': raise DomainError('草稿已结束，请重新选商品。')
@@ -337,11 +351,27 @@ class App(PaymentUI,AdminUI):
             p=self.s.product(int(args[0]))
             placement=p['placement']
             status='上架' if p['active'] else '下架'
-            self.send(u,f'{PRODUCT_PLACEMENTS[placement]} · {status}\n'+self.product_text(p),[
+            rows=[
                 [('修改','editproduct:'+args[0]),('下架' if p['active'] else '上架','toggle:'+args[0])],
                 [('上移','move:'+args[0]+':-1'),('下移','move:'+args[0]+':1')],
-                [('返回商品管理','catalog:'+placement)],
-            ])
+            ]
+            pricing=self.tier_text(product_tiers(p))
+            rows.append([('调整档位','pprofile:'+args[0])])
+            rows.append([('返回商品管理','catalog:'+placement)])
+            self.send(u,f'{PRODUCT_PLACEMENTS[placement]} · {status} · {pricing}\n'+self.product_text(p),rows)
+        elif action=='pprofile':
+            p=self.s.product(int(args[0]))
+            if len(args)!=1: raise DomainError('旧档位按钮已失效，请重新打开商品。')
+            self.s.set_session(u,{'mode':'tier_input','product_id':p['id'],'revision':p['revision']})
+            self.send(u,f"当前：{self.tier_text(product_tiers(p))}\n"
+                      '请一次发完整档位，每行写「名称:价格」，例如：\n新菜:1\n大众名:2\n剩菜:12\n'
+                      '最低价为下单价。发送「关闭档位」可保留当前单价。',
+                      [[('取消','manage:'+args[0])]])
+        elif action=='psavetiers':
+            if state.get('mode')!='tier_preview' or not args or state['key']!=args[0]:
+                raise DomainError('档位预览已失效，请重新设置。')
+            self.s.set_product_tiers(u,state['product_id'],state['revision'],state['tiers'])
+            self.callback(u,'manage:'+str(state['product_id']))
         elif action=='toggle':
             p=self.s.product(int(args[0])); p['active']=1-p['active']; self.s.save_product(u,p); self.callback(u,'catalog:'+p['placement'])
         elif action=='move':
@@ -409,9 +439,38 @@ class App(PaymentUI,AdminUI):
             self.s.queue_bulk(u,state['batch'],state['results'])
             self.s.set_session(u,{})
             self.send(u,'批量回单已排队。')
+        elif action=='quote':
+            order=self.s.order(args[0])
+            tiers=product_tiers(json.loads(order['snapshot']))
+            rows=[[(f'{tier} · {price}U',f'qoffer:{order["id"]}:{price}')]
+                  for tier,price in tiers.items() if price>order['price']]
+            if order['status']!='pending' or not rows: raise DomainError('当前订单没有可升的档位。')
+            rows.append([('返回订单','order:'+order['id'])])
+            self.send(u,f"当前 {order['price']} 积分，请选择可办理的档位。点选即向客户发报价。",rows)
+        elif action=='qoffer':
+            order=self.s.order(args[0])
+            tiers=product_tiers(json.loads(order['snapshot']))
+            tier=next((tier for tier,price in tiers.items() if str(price)==args[1]),None)
+            self.s.offer_quote(u,order['id'],tier)
+            self.send(u,'报价已排队，等待客户确认。',[[('返回订单','order:'+order['id'])]])
+        elif action in ('qaccept','qdecline'):
+            try:
+                result=self.s.resolve_quote(u,args[0],action=='qaccept')
+            except InsufficientPoints as error:
+                self.send(u,f'还差 {error.missing} 积分。充值后请回到原报价卡重新确认。',[[('去充值','topup')]])
+                return
+            text={'accepted':'已冻结差价，订单继续处理。','declined':'订单已取消，冻结积分已退回。',
+                  'expired':'报价已超时，订单已取消，冻结积分已退回。'}[result]
+            self.card(u,text,message_id=message_id)
         elif action=='order':
             o=self.s.order(args[0]); p=json.loads(o['snapshot'])
-            details=[f"{p['name']} · {ORDER_STATES[o['status']]} · {o['price']} 积分"]
+            tiers=product_tiers(p)
+            quote=self.s.open_quote(o['id'])
+            status='等待客户确认补差价' if quote else ORDER_STATES[o['status']]
+            details=[f"{p['name']} · {status} · {o['price']} 积分"]
+            tier=next((name for name,price in tiers.items() if price==o['price']),None)
+            if tier: details.append(f'当前档位：{tier}')
+            if quote: details.append(f"已报价：{quote['tier']} · {quote['price']}U")
             if o.get('data_cleared_at'): details.append('原始资料及回单内容已按保留规则清理。')
             attachments=[]
             for index,items in json.loads(o['submission']).items():
@@ -423,14 +482,16 @@ class App(PaymentUI,AdminUI):
                         attachments.append(item)
             details.append(f"客户 {o['user_id']} · 编号 {o['id']}")
             rows=[[('查看回单','receipts:'+o['id'])]]
-            if o['status']=='pending':
+            if o['status']=='pending' and not quote:
                 details.append('回复这条消息暂存回单。')
                 rows[0].append(('发送回单','finish:'+o['id']))
                 rows.append([('空单退分','refund:'+o['id']+':empty'),('管理员取消','refund:'+o['id']+':cancel')])
             elif o['status']=='uncertain':
                 rows.append([('管理员取消','refund:'+o['id']+':cancel')])
+            if o['status']=='pending' and any(price>o['price'] for price in tiers.values()):
+                rows.append([('重新报价' if quote else '发起补差价','quote:'+o['id'])])
             result=self.send(u,'\n'.join(details),rows)
-            if o['status']=='pending': self.s.link_reply(result['message_id'],o['id'])
+            if o['status']=='pending' and not quote: self.s.link_reply(result['message_id'],o['id'])
             for item in attachments: self.send_payload(u,item)
         elif action=='receipts':
             if self.s.order(args[0]).get('data_cleared_at'):
@@ -504,17 +565,25 @@ class App(PaymentUI,AdminUI):
         if pages>1: title+=f'\n第 {page+1} / {pages} 页'
         self.card(u,title,rows,message_id=message_id)
 
+    def tier_text(self,tiers):
+        return ' / '.join(f'{name} {price}U' for name,price in sorted(tiers.items(),key=lambda pair:pair[1])) or '单价'
+
     def product_text(self,p):
-        return f"{p.get('name','')}\n{p.get('price','')} 积分 / 单 · 预计 {p.get('eta','')}\n{p.get('description','')}\n提交资料："+'、'.join(f["name"]+'（'+FIELD_TYPES[f["kind"]]+'）' for f in p.get('fields',[]))
+        tiers=product_tiers(p)
+        price=min(tiers.values()) if tiers else p.get('price','')
+        return f"{p.get('name','')}\n{price} 积分 / 单 · 预计 {p.get('eta','')}\n{p.get('description','')}\n提交资料："+'、'.join(f["name"]+'（'+FIELD_TYPES[f["kind"]]+'）' for f in p.get('fields',[]))
     def product_preview(self,u,state,message_id=None):
         state.update(mode='product_preview',key=uid())
         self.s.set_session(u,state)
         product=state['product']
         placement=product.get('placement','home')
-        self.card(u,f'商品预览 · {PRODUCT_PLACEMENTS[placement]}\n'+self.product_text(product),[
-            [(f'移到{name}',f"pplacement:{state['key']}:{key}") for key,name in PRODUCT_PLACEMENTS.items() if key!=placement],
-            [('确认保存','saveproduct:'+state['key']),('取消','admin')],
-        ],message_id=message_id)
+        title=f'商品预览 · {PRODUCT_PLACEMENTS[placement]}'
+        tiers=product_tiers(product)
+        if tiers:
+            title+='\n'+self.tier_text(tiers)
+        rows=[[(f'移到{name}',f"pplacement:{state['key']}:{key}") for key,name in PRODUCT_PLACEMENTS.items() if key!=placement]]
+        rows.append([('确认保存','saveproduct:'+state['key']),('取消','admin')])
+        self.card(u,title+'\n'+self.product_text(product),rows,message_id=message_id)
     def product_fields_view(self,u,state):
         fields=state['product']['fields']
         lines=[f'{i}. {f["name"]} · {FIELD_TYPES[f["kind"]]}' for i,f in enumerate(fields,1)]
@@ -556,8 +625,15 @@ class App(PaymentUI,AdminUI):
         missing=[i for i in range(len(p['fields'])) if not r['data'].get(str(i))]
         details=[f"🛍 {p['name']}"]
         rows=[]
+        price=p['price']
+        if r['tier_price'] is not None:
+            if p['revision']!=r['revision'] or not p['active']:
+                raise DomainError('档位已更新，请重新打开商品选择。')
+            price=r['tier_price']
+            tier=next(name for name,value in product_tiers(p).items() if value==price)
+            details.append(f'档位：{tier} · {price} 积分 / 单')
         if show_product:
-            details.append(f"{p['price']} 积分 / 单 · 预计 {p['eta']}")
+            details.append(f"预计 {p['eta']}" if r['tier_price'] is not None else f"{price} 积分 / 单 · 预计 {p['eta']}")
             if p['description']: details.append(p['description'])
         if missing or prompt_only or show_product:
             verb='发送' if field['kind']=='text' else '上传'
@@ -576,7 +652,7 @@ class App(PaymentUI,AdminUI):
                 else: details.append(f"{f['name']}：已收到 {len(items)} 份{FIELD_TYPES[f['kind']]}")
             try:
                 count=len(self.s.submissions(r,p))
-                details.append(f'共 {count} 单，需 {count*p["price"]} 积分。')
+                details.append(f'共 {count} 单，需 {count*price} 积分。')
                 rows.insert(0,[('确认提交',f'confirm:{d}:{r["edit_version"]}'),('修改','field:'+d+':0')])
             except DomainError as error: details.append(str(error))
         if len(p['fields'])>1:
@@ -678,6 +754,26 @@ class App(PaymentUI,AdminUI):
             preview='\n'.join(f'{account} {results[account]}' for account in orders)
             self.send(u,f'回单预览 · 成功 {len(results)-empty} 单 · 空单 {empty} 单\n\n{preview}',
                       [[('确认发送','bulkyes:'+key),('取消','admin')]],theme=False)
+            return
+        if state.get('mode') in ('tier_input','tier_preview'):
+            self.s.admin(u)
+            if not text.strip(): raise DomainError('请发送档位名称和价格。')
+            tiers={}
+            if text.strip()!='关闭档位':
+                for line in text.splitlines():
+                    if not line.strip(): continue
+                    name,separator,price=line.replace('：',':').rpartition(':')
+                    name=name.strip()
+                    if not separator or not name or name in tiers or len(name)>30 or not price.strip().isascii() or not price.strip().isdigit() or len(price.strip())>10:
+                        raise DomainError('每行填写不同的名称和正整数价格，例如「新菜:1」。')
+                    tiers[name]=int(price)
+                if not 1<=len(tiers)<=10 or len(set(tiers.values()))!=len(tiers) or any(not 1<=price<=10**9 for price in tiers.values()):
+                    raise DomainError('最多 10 档，价格须为不同的正整数。')
+            state.update(mode='tier_preview',tiers=tiers,key=uid())
+            self.s.set_session(u,state)
+            self.send(u,'确认档位：'+(self.tier_text(tiers) if tiers else '关闭档位，保留当前单价'),[
+                [('确认保存','psavetiers:'+state['key']),('取消','manage:'+str(state['product_id']))],
+            ])
             return
         guided={'draft','draft_cancel','product','product_fields','product_field_name','product_field_type',
                 'adjust_user','adjust_amount','adjust_reason','refund_reason','topup'}
@@ -802,6 +898,21 @@ class App(PaymentUI,AdminUI):
                     text='✉️'+text[1:]
             elif e['kind']=='credited': text=''
             elif e['kind']=='maintenance': text=p['text']
+            elif e['kind']=='quote':
+                quote=self.s.open_quote(p['order'])
+                if not quote or quote['id']!=p['quote']:
+                    with self.s.tx() as c:
+                        c.execute("UPDATE events SET state='cancelled' WHERE id=? AND state='pending'",(e['id'],))
+                    continue
+                order=self.s.order(p['order'])
+                name=json.loads(order['snapshot'])['name']
+                text=(f"{name} · 补差价\n当前 {order['price']} 积分 · {quote['tier']} {quote['price']}U"
+                      f"\n需补 {quote['price']-order['price']} 积分\n有效期 24 小时，超时自动取消并退回冻结积分。")
+                rows=[[('确认补差价','qaccept:'+quote['id'])],
+                      [('取消并退积分','qdecline:'+quote['id'])]]
+            elif e['kind']=='quote_accepted':
+                text=f"客户已确认 {p['tier']} · {p['price']}U，可以继续处理。"
+                rows=[[('查看订单','order:'+p['order'])]]
             elif e['kind']=='summary':
                 if p['success']==1 and not p['refund']:
                     text=f"✔️ 已完成 · 已扣 {p['charged']} 积分"

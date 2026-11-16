@@ -231,4 +231,4 @@ class RetentionTests(Fixture, unittest.TestCase):
         self.assertGreater(upgraded.one('SELECT updated_at FROM sessions')['updated_at'],self.age(1))
         self.assertGreater(upgraded.events()[0]['finished_at'],self.age(1))
         self.assertEqual('home',upgraded.product(1)['placement'])
-        self.assertEqual(10,Store(path,99).one('SELECT MAX(version) AS n FROM schema_migrations')['n'])
+        self.assertEqual(13,Store(path,99).one('SELECT MAX(version) AS n FROM schema_migrations')['n'])

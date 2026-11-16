@@ -34,7 +34,9 @@ class Runtime:
             try:
                 if time.monotonic()>=maintenance_at:
                     maintenance_at=time.monotonic()+60
-                    try: self.retention.tick()
+                    try:
+                        self.s.expire_quotes()
+                        self.retention.tick()
                     except Exception as error:
                         log.error('Maintenance unavailable (%s)',type(error).__name__)
                 self.app.deliver(); self.app.flush_events()
