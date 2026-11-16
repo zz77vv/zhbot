@@ -870,7 +870,7 @@ class App(PaymentUI,AdminUI):
     def deliver(self):
         for o in self.s.rows("SELECT * FROM orders WHERE status='delivering' AND (retry_at IS NULL OR retry_at<=CURRENT_TIMESTAMP)"):
             try:
-                for r in self.s.receipts(o['id']):
+                for r in self.s.receipts(o['id'],include_context=True):
                     if r['state']=='sent': continue
                     if r['state']!='staged': raise DomainError('投递状态不确定')
                     self.s.mark_sending(r['id'])

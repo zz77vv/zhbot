@@ -1,6 +1,7 @@
 """Paged administrator queues and snapshot-bound single-order receipt previews."""
 import hashlib
 import json
+from .receipt_content import original_submission
 
 from .store import DomainError, uid
 
@@ -128,6 +129,8 @@ class AdminUI:
         snapshot = receipt_snapshot(receipts)
         name = json.loads(order['snapshot'])['name']
         self.send(u, f"✉️ 回单预览\n{name} · {subject(order)}\n客户 {order['user_id']}\n以下内容将按顺序发送给客户。")
+        for item in original_submission(order):
+            self.send_payload(u,item)
         for receipt in receipts:
             item = json.loads(receipt['payload'])
             if item['kind'] == 'text':
@@ -158,7 +161,7 @@ class AdminUI:
                     or fingerprint(snapshot) != state['fingerprint']):
                 raise DomainError('回单或订单状态已变化。')
             # Store repeats this comparison while holding its delivery transaction lock.
-            self.s.begin_delivery(u, order['id'], expected_receipts=state['receipts'])
+            self.s.begin_delivery(u, order['id'], expected_receipts=state['receipts'], include_submission=True)
         except DomainError as error:
             self.s.set_session(u, {})
             raise DomainError('回单或订单状态已变化，请重新预览后再发送。') from error

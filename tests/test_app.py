@@ -365,7 +365,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.app.flush_events()
         messages=[d['text'] for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1]
         self.assertEqual(1,len(messages))
-        self.assertIn('abc 查询结果🛍\ndef 空',messages[0])
+        self.assertIn('原报单：abc\n回单：查询结果🛍\n\n2. 原报单：def\n回单：空单，退回 3 积分',messages[0])
         customer_calls=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1]
         self.assertEqual([],customer_calls[0]['reply_markup']['inline_keyboard'])
         self.assertEqual(1,len(customer_calls[0]['entities']))

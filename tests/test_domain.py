@@ -17,6 +17,19 @@ class Fixture:
         return d
 
 class DomainTests(Fixture, unittest.TestCase):
+    def test_long_bulk_receipt_settles_only_the_delivered_part(self):
+        batch=self.s.confirm(1,self.draft('first\nsecond'))
+        self.s.queue_bulk(99,batch,{'first':'甲'*1900,'second':'乙'*1900})
+        first,second=[e for e in self.s.events() if e['kind']=='bulk_receipt']
+        with self.s.tx() as c:
+            self.s.finish_bulk(c,first,123)
+        self.assertEqual(['completed','bulk_delivering'],[order['status'] for order in self.s.orders(batch)])
+        self.assertEqual((4,3),self.s.balance(1))
+        with self.s.tx() as c:
+            self.s.finish_bulk(c,second,124)
+        self.assertEqual(['completed','completed'],[order['status'] for order in self.s.orders(batch)])
+        self.assertEqual((4,0),self.s.balance(1))
+
     def test_secondary_quote_is_per_order_and_expiration_refunds_once(self):
         self.s.set_product_tiers(99,self.p,self.s.product(self.p)['revision'],{'新菜':3,'大众名':4,'剩菜':12})
         batch=self.s.confirm(1,self.draft())

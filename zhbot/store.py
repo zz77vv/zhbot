@@ -6,6 +6,7 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from .receipt_content import bulk_sections, original_submission
 
 LEGACY_TIERS = {
     'owner': {'新菜': 1, '大众名': 2, '剩菜': 12},
@@ -284,7 +285,9 @@ class Store:
         reason='补差价报价已超时' if state=='expired' else '客户拒绝补差价'
         c.execute('UPDATE order_quotes SET state=? WHERE id=?',(state,quote['id']))
         self._refund_pending(c,order,order['user_id'],'cancel',reason,source='补差价取消')
-    def receipts(self,o): return self.rows('SELECT * FROM receipts WHERE order_id=? ORDER BY id',(o,))
+    def receipts(self,o,*,include_context=False):
+        return self.rows('SELECT * FROM receipts WHERE order_id=? AND (? OR context=0) ORDER BY context DESC,id',
+                         (o,include_context))
     def bulk_rows(self,actor,batch):
         self.admin(actor)
         with self.connect() as c:
@@ -313,24 +316,27 @@ class Store:
             orders=self._bulk_rows(c,batch)
             if orders.keys()!=results.keys() or any(not value.strip() or '\n' in value or '\r' in value for value in results.values()):
                 raise DomainError('回单必须与这批账号一一对应。')
-            items={order['id']:results[account] for account,order in orders.items()}
-            charged=sum(o['price'] for account,o in orders.items() if results[account]!='空')
-            returned=sum(o['price'] for account,o in orders.items() if results[account]=='空')
-            lines='\n'.join(f'{account} {results[account]}' for account in orders)
-            text=f'✉️ 回单结果\n\n{lines}\n\n扣费 {charged} 积分 · 退回 {returned} 积分'
-            if len(text.encode('utf-16-le'))//2>4000:
-                raise DomainError('回单太长，请缩短结果或逐单处理。')
-            first=next(iter(orders.values()))
+            groups=bulk_sections(orders,results)
+            if not groups:
+                raise DomainError('有一条原报单和回单合计过长，请逐单发送以保留全文。')
             c.execute("UPDATE orders SET status='bulk_delivering' WHERE batch_id=?",(batch,))
-            c.execute('INSERT INTO events(event_key,kind,target,payload) VALUES(?,?,?,?)',
-                      ('bulk:'+uid(),'bulk_receipt',first['user_id'],dump({'batch':batch,'items':items,'text':text,'actor':actor})))
-            self.audit(c,actor,'bulk_queue',batch,f'{len(items)} 单')
+            for index,group in enumerate(groups,1):
+                items={order['id']:result for order,result,_ in group}
+                charged=sum(order['price'] for order,result,_ in group if result!='空')
+                returned=sum(order['price'] for order,result,_ in group if result=='空')
+                part=f' · {index}/{len(groups)}' if len(groups)>1 else ''
+                lines='\n\n'.join(text for _,_,text in group)
+                text=f'✉️ 回单结果{part}\n\n{lines}\n\n扣费 {charged} 积分 · 退回 {returned} 积分'
+                self.event(c,'bulk:'+uid(),'bulk_receipt',group[0][0]['user_id'],
+                           {'batch':batch,'items':items,'text':text,'actor':actor})
+            self.audit(c,actor,'bulk_queue',batch,f'{len(orders)} 单')
     def finish_bulk(self,c,event,message_id,*,cancel=False):
         if not cancel and (type(message_id) is not int or message_id<=0):
             raise DomainError('缺少回单消息编号。')
         payload=json.loads(event['payload'])
-        orders=c.execute('SELECT * FROM orders WHERE batch_id=?',(payload['batch'],)).fetchall()
-        if not orders or any(o['status']!='bulk_delivering' for o in orders):
+        orders=[o for o in c.execute('SELECT * FROM orders WHERE batch_id=?',(payload['batch'],))
+                if o['id'] in payload['items']]
+        if not orders or len(orders)!=len(payload['items']) or any(o['status']!='bulk_delivering' or o['user_id']!=event['target'] for o in orders):
             raise DomainError('批次状态已改变，请核实回单。')
         for order in orders:
             oid=order['id']
@@ -364,16 +370,19 @@ class Store:
         with self.tx() as c:
             self.require_pending(c,o)
             c.execute('DELETE FROM receipts WHERE id=? AND order_id=?',(rid,o)); self.audit(c,actor,'receipt_delete',o,str(rid))
-    def begin_delivery(self,actor,o,expected_receipts=None):
+    def begin_delivery(self,actor,o,expected_receipts=None,*,include_submission=False):
         self.admin(actor)
         with self.tx() as c:
-            self.require_pending(c,o)
+            order=self.require_pending(c,o)
             receipts=[dict(r) for r in c.execute('SELECT id,payload,state FROM receipts WHERE order_id=? ORDER BY id',(o,))]
             if not receipts: raise DomainError('还没有回单，请先添加；无结果请用空单退分。')
             if expected_receipts is not None and receipts!=expected_receipts:
                 raise DomainError('回单已修改，请重新预览后发送。')
             if any(r['state']!='staged' for r in receipts):
                 raise DomainError('回单状态已改变，请核实后再处理。')
+            if include_submission:
+                c.executemany('INSERT INTO receipts(order_id,payload,context) VALUES(?,?,1)',
+                              ((o,dump(item)) for item in original_submission(order)))
             c.execute("UPDATE orders SET status='delivering' WHERE id=?",(o,)); self.audit(c,actor,'deliver',o)
     def mark_sending(self,rid):
         with self.tx() as c:
@@ -422,7 +431,7 @@ class Store:
             old=c.execute('SELECT * FROM orders WHERE id=?',(o,)).fetchone()
             if old and old['status']==kind: return
             if old and old['status']=='uncertain' and kind=='cancel':
-                if not reason.strip() or c.execute("SELECT 1 FROM receipts WHERE order_id=? AND state!='staged'",(o,)).fetchone():
+                if not reason.strip() or c.execute("SELECT 1 FROM receipts WHERE order_id=? AND (state='sending' OR (context=0 AND state!='staged'))",(o,)).fetchone():
                     raise DomainError('仅全部回单明确未送达且填写原因时才可取消')
                 r=old
             else:

@@ -92,8 +92,27 @@ class AdminUXTests(Fixture, unittest.TestCase):
         self.click(confirm)
         self.app.deliver()
         delivered = [(method, data) for method, data in self.t.calls if data.get('chat_id') == 1]
-        self.assertEqual(3, len(delivered))
-        self.assertEqual(receipts[0]['text'], delivered[0][1]['text'])
+        self.assertEqual(4, len(delivered))
+        self.assertIn('原报单',delivered[0][1]['text'])
+        self.assertIn('回单结果',delivered[0][1]['text'])
+        self.assertEqual(receipts[0]['text'], delivered[1][1]['text'])
+
+    def test_receipt_replays_full_original_text_and_attachment_to_customer(self):
+        product=dict(self.s.product(self.p),fields=[{'name':'说明','kind':'text'},{'name':'文件','kind':'document'}])
+        self.s.save_product(99,product)
+        draft=self.s.new_draft(1,self.p)
+        original='原'*2100+'最后一行'
+        self.s.set_field(1,draft,0,{'kind':'text','text':original})
+        self.s.set_field(1,draft,1,{'kind':'document','file_id':'original-file','caption':'原附件'})
+        order,=self.s.orders(self.s.confirm(1,draft))
+        self.s.add_receipt(99,order['id'],{'kind':'document','file_id':'result-file'})
+        self.click(self.preview(order))
+        self.app.deliver()
+        self.assertEqual('completed',self.s.order(order['id'])['status'])
+        delivered=[data for _,data in self.t.calls if data.get('chat_id')==1]
+        self.assertIn(original,''.join(data.get('text','') for data in delivered))
+        self.assertEqual(['original-file','result-file'],[data['document'] for data in delivered if 'document' in data])
+        self.assertEqual((7,0),self.s.balance(1))
 
     def test_receipt_changes_invalidate_confirmation_even_when_count_is_unchanged(self):
         order = self.order()
