@@ -42,7 +42,7 @@ class AppTests(Fixture, unittest.TestCase):
         goods=[[b for b in row if b.get('callback_data','').startswith('buy:')] for row in rows]
         goods=[row for row in goods if row]
         self.assertEqual([2,1,2,2,1],[len(row) for row in goods])
-        self.assertTrue(all(b['style']=='success' for row in goods for b in row))
+        self.assertTrue(all(b['style']=='primary' for row in goods for b in row))
         self.assertEqual('查询',goods[0][0]['text'])
         self.assertFalse(any('积分' in b['text'] for row in goods for b in row))
         recharge=rows[-1][0]
@@ -210,7 +210,7 @@ class AppTests(Fixture, unittest.TestCase):
         ]
         self.assertEqual(UI_ICONS['✔️'],first[0]['icon_custom_emoji_id'])
         self.assertEqual('success',first[0]['style'])
-        self.assertEqual(['danger','primary','success'],[button['style'] for button in first[1:]])
+        self.assertEqual(['danger','primary','primary'],[button['style'] for button in first[1:]])
         self.assertEqual('✔️ 确认发送',retry[0]['text'])
         self.assertEqual('success',retry[0]['style'])
         self.assertNotIn('icon_custom_emoji_id',retry[0])

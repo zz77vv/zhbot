@@ -14,7 +14,7 @@ ORDER_STATES = {
 }
 BUTTON_STYLES = {
     **dict.fromkeys(('确认提交','确认发送','发送回单','确认保存','确认保存并上架','确认调整','去付款'), 'success'),
-    **dict.fromkeys(('取消','取消报单','确认取消','管理员取消','空单退分','确认退款','删除','放弃'), 'danger'),
+    **dict.fromkeys(('取消','取消报单','取消并退积分','确认取消','管理员取消','空单退分','确认退款','删除','放弃'), 'danger'),
 }
 BUTTON_ICONS = {
     # Verified custom emoji from https://t.me/addemoji/NewsEmoji.
@@ -58,8 +58,7 @@ def keyboard(rows, custom_emoji=True):
                 label,data=item
                 button={'text':label,'callback_data':data}
             label=button['text']
-            is_product=button.get('callback_data','').startswith('buy:')
-            button['style']='success' if is_product else BUTTON_STYLES.get(label,'primary')
+            button['style']=BUTTON_STYLES.get(label,'primary')
             icon=BUTTON_ICONS.get(label)
             if icon:
                 if custom_emoji:
@@ -148,15 +147,17 @@ class App(PaymentUI,AdminUI):
         except (DomainError,ValueError,KeyError,IndexError) as e:
             self.send(actor,str(e) if isinstance(e,DomainError) else '输入格式不正确，请检查后重试。')
     def home(self,u,page=0,message_id=None,placement='home'):
-        a,f=self.s.balance(u)
         products=self.s.products(placement=placement)
         page_action='home' if placement=='home' else 'region'
         pages=max(1,(len(products)+7)//8)
         page=max(0,min(page,pages-1))
         rows=[]
         for p in products[page*8:(page+1)*8]:
-            button=(p['name'],'buy:'+str(p['id']))
-            if len(button[0])<=18 and rows and len(rows[-1])==1 and len(rows[-1][0][0])<=18:
+            label=p['name']
+            if placement=='region':
+                label=label.removesuffix('神父').rstrip() or label
+            button=(label,'buy:'+str(p['id']))
+            if len(label)<=12 and rows and len(rows[-1])==1 and len(rows[-1][0][0])<=12:
                 rows[-1].append(button)
             else:
                 rows.append([button])
@@ -167,26 +168,19 @@ class App(PaymentUI,AdminUI):
             rows.append(nav)
         if placement=='home':
             rows.append([('地区神父','region')])
+            rows.append([('充值积分','topup')])
+            if u==self.s.admin_id: rows.append([('管理后台','admin')])
+            a,f=self.s.balance(u)
+            lines=['🛍 综合服务','',f'💵 可用积分：{a}']
+            if f: lines.append(f'冻结积分：{f}')
         else:
             rows.append([('返回首页','home:0')])
-        rows.append([('充值积分','topup')])
-        if placement=='home' and u==self.s.admin_id: rows.append([('管理后台','admin')])
-        title='综合服务' if placement=='home' else PRODUCT_PLACEMENTS[placement]
-        lines=[f'🛍 {title}','',f'💵 可用积分：{a}']
-        if f: lines.append(f'冻结积分：{f}')
-        empty='暂无上架服务' if placement=='home' else '暂无项目'
-        lines += ['', '请选择需要的服务' if products else empty]
+            lines=[PRODUCT_PLACEMENTS[placement]]
+        if not products:
+            lines+=['','暂无上架服务' if placement=='home' else '暂无项目']
         if pages>1: lines.append(f'第 {page+1} / {pages} 页')
         text='\n'.join(lines)
-        entities=ui_entities(text)
-        if message_id is not None:
-            try:
-                self.call_with_buttons('editMessageText',rows,chat_id=u,message_id=message_id,text=text,entities=entities)
-                return
-            except TelegramRejected as error:
-                if error.code!=400: raise
-        self.call_with_buttons('sendMessage',rows,chat_id=u,text=text,entities=entities,
-                               link_preview_options={'is_disabled':True})
+        self.card(u,text,rows,message_id=message_id)
     def admin_home(self,u):
         self.s.admin(u)
         pending=self.s.one("SELECT COUNT(*) AS n FROM orders WHERE status='pending'")['n']
@@ -223,9 +217,13 @@ class App(PaymentUI,AdminUI):
             if action=='buy' and tiers:
                 rows=[[(f'{name} · {price}U',f'buytier:{p["id"]}:{p["revision"]}:{price}')]
                       for name,price in sorted(tiers.items(),key=lambda pair:pair[1])]
-                back='region' if p['placement']=='region' else 'home:0'
-                rows.append([('返回',back)])
-                self.card(u,'\n'.join(filter(None,(p['name'],p['description'],f"预计 {p['eta']}",'请选择档位'))),
+                back=('返回地区神父','region') if p['placement']=='region' else ('返回首页','home:0')
+                rows.append([back])
+                details=[p['name']]
+                if p['description']: details.append(p['description'])
+                if p['eta']: details.append(f"预计 {p['eta']}")
+                details+=['','请选择办理档位']
+                self.card(u,'\n'.join(details),
                           rows,message_id=message_id)
             else:
                 selected=int(args[2]) if action=='buytier' else None
