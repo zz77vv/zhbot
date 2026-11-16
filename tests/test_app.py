@@ -112,7 +112,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.msg('a\nb')
         card=self.t.calls[-1][1]
         self.assertIn('档位：加急',card['text'])
-        self.assertIn('共 2 单，需 8 积分',card['text'])
+        self.assertIn('2 单 × 4 积分\n需冻结 8 积分',card['text'])
         self.click(card['reply_markup']['inline_keyboard'][0][0]['callback_data'])
         self.assertEqual([4,4],[order['price'] for order in self.s.orders()])
         self.assertEqual((2,8),self.s.balance(1))
@@ -186,7 +186,7 @@ class AppTests(Fixture, unittest.TestCase):
         self.assertIn('批量报单每行一个',cards[0]['text'])
         self.assert_custom_icon(cards[0],'🛍',UI_ICONS['🛍'])
         self.msg('first'); self.msg('a\nb')
-        self.assertIn('共 2 单，需 6 积分',self.t.calls[-1][1]['text'])
+        self.assertIn('2 单 × 3 积分\n需冻结 6 积分',self.t.calls[-1][1]['text'])
         d=self.s.session(1)['draft']; self.click('confirm:'+d+':'+str(self.s.draft(1,d)['edit_version']))
         self.assertEqual(2,len(self.s.orders())); self.assertEqual((4,6),self.s.balance(1))
         method,receipt=self.t.calls[-1]
@@ -245,13 +245,16 @@ class AppTests(Fixture, unittest.TestCase):
         self.assertEqual(1,len(self.s.receipts(o))); self.assertEqual('pending',self.s.order(o)['status'])
         self.click('finish:'+o,99)
         self.assertEqual('pending',self.s.order(o)['status'])
-        preview=[data for method,data in self.t.calls if method=='sendMessage' and data.get('chat_id')==99 and data.get('text')==raw]
+        preview=[data for method,data in self.t.calls if method=='sendMessage' and data.get('chat_id')==99
+                 and data.get('text','').endswith('回单结果\n'+raw)]
         self.assertEqual(1,len(preview))
         self.assertNotIn('entities',preview[0])
         self.click('sendreceipt:'+self.s.session(99)['key'],99); self.app.deliver()
         self.assertEqual('completed',self.s.order(o)['status'])
-        delivered=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1 and d.get('text')==raw]
+        delivered=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1]
         self.assertEqual(1,len(delivered))
+        self.assertEqual(preview[0]['text'],delivered[0]['text'])
+        self.assertIn('原报单',delivered[0]['text'])
         self.assertNotIn('entities',delivered[0])
         self.app.flush_events()
         summary=[d for method,d in self.t.calls if method=='sendMessage' and d.get('chat_id')==1 and '已完成 · 已扣' in d.get('text','')]

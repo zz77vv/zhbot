@@ -41,14 +41,19 @@ class PaymentUI:
         rows = []
         did = self._payment_draft(u, did) if did else None
         if did:
-            rows.append([('继续填写资料', 'resume:' + did)])
+            draft=self.s.draft(u,did)
+            product=self.s.product(draft['product_id'])
+            complete=all(draft['data'].get(str(i)) for i in range(len(product['fields'])))
+            rows.append([('返回报单确认' if complete else '继续填写资料', 'resume:' + did)])
         rows.append([('返回首页', 'home')])
         return rows
 
-    def topup_view(self, u):
+    def topup_view(self, u, draft_id=None):
         if not self.payments:
             raise DomainError('充值暂未开放，请联系管理员。')
-        did = self._payment_draft(u)
+        did = self._payment_draft(u, draft_id)
+        if draft_id and not did:
+            raise DomainError('这份报单已结束，请重新选择项目。')
         state = {'mode': 'topup'}
         if did:
             state['resume_draft'] = did

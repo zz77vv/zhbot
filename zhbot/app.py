@@ -13,7 +13,7 @@ ORDER_STATES = {
     'completed':'已完成', 'empty':'已退款', 'cancel':'已退款',
 }
 BUTTON_STYLES = {
-    **dict.fromkeys(('确认提交','确认发送','发送回单','确认保存','确认保存并上架','确认调整','去付款'), 'success'),
+    **dict.fromkeys(('确认','确认提交','确认发送','发送回单','确认保存','确认保存并上架','确认调整','去付款'), 'success'),
     **dict.fromkeys(('取消','取消报单','取消并退积分','确认取消','管理员取消','空单退分','确认退款','删除','放弃'), 'danger'),
 }
 BUTTON_ICONS = {
@@ -156,7 +156,7 @@ class App(PaymentUI,AdminUI):
             label=p['name']
             if placement=='region':
                 label=label.removesuffix('神父').rstrip() or label
-            button=(label,'buy:'+str(p['id']))
+            button=(label,f'buy:{p["id"]}:{page}' if page else 'buy:'+str(p['id']))
             if len(label)<=12 and rows and len(rows[-1])==1 and len(rows[-1][0][0])<=12:
                 rows[-1].append(button)
             else:
@@ -183,7 +183,8 @@ class App(PaymentUI,AdminUI):
         self.card(u,text,rows,message_id=message_id)
     def admin_home(self,u):
         self.s.admin(u)
-        pending=self.s.one("SELECT COUNT(*) AS n FROM orders WHERE status='pending'")['n']
+        pending=self.s.one("SELECT COUNT(*) AS n FROM orders o WHERE status='pending' AND NOT EXISTS "
+                           "(SELECT 1 FROM order_quotes q WHERE q.order_id=o.id AND q.state='pending')")['n']
         self.send(u,f'管理后台 · 待处理 {pending} 单',[
             [('待处理订单','pending')],
             [('商品管理','catalog'),('积分管理','adjust')],
@@ -193,9 +194,9 @@ class App(PaymentUI,AdminUI):
     def callback(self,u,data,message_id=None):
         bits=data.split(':'); action=bits[0]; args=bits[1:]
         admin_actions={'admin','database','catalog','newproduct','manage','editproduct','saveproduct','pfieldkind','paddfield','pfieldsdone','pkeepfields','move','toggle','pending','order','batch','bulk','bulkyes','receipts','delreceipt','finish','sendreceipt','refund','refundyes','adjust','adjustyes','exceptions','opshelp'}
-        if action in admin_actions or action in ('pplacement','pprofile','psavetiers','quote','qoffer'): self.s.admin(u)
+        if action in admin_actions or action in ('pplacement','pprofile','psavetiers','quote','qoffer','verify','vpart','vstart','vconfirm'): self.s.admin(u)
         state=self.s.session(u)
-        if action in ('catalog','manage','pending','batch','order','receipts'):
+        if action in ('catalog','manage','pending','batch','order','receipts','verify'):
             self.s.set_session(u,{})
         if action=='home':
             self.s.set_session(u,{})
@@ -215,9 +216,10 @@ class App(PaymentUI,AdminUI):
             if not p['active']: raise DomainError('商品已下架')
             tiers=product_tiers(p)
             if action=='buy' and tiers:
+                page=max(0,int(args[1])) if len(args)>1 else 0
                 rows=[[(f'{name} · {price}U',f'buytier:{p["id"]}:{p["revision"]}:{price}')]
                       for name,price in sorted(tiers.items(),key=lambda pair:pair[1])]
-                back=('返回地区神父','region') if p['placement']=='region' else ('返回首页','home:0')
+                back=('返回地区神父',f'region:{page}') if p['placement']=='region' else ('返回首页',f'home:{page}')
                 rows.append([back])
                 details=[p['name']]
                 if p['description']: details.append(p['description'])
@@ -229,7 +231,8 @@ class App(PaymentUI,AdminUI):
                 selected=int(args[2]) if action=='buytier' else None
                 revision=int(args[1]) if action=='buytier' else None
                 d=self.s.new_draft(u,p['id'],tier_price=selected,expected_revision=revision)
-                self.s.set_session(u,{'mode':'draft','draft':d,'field':0})
+                self.s.set_session(u,{'mode':'draft','draft':d,'field':0,'card_id':message_id} if action=='buytier'
+                                   else {'mode':'draft','draft':d,'field':0})
                 self.draft_view(u,d,show_product=True)
         elif action=='field':
             d=args[0]
@@ -421,9 +424,43 @@ class App(PaymentUI,AdminUI):
                 self.s.set_session(u,state)
                 self.send(u,'请输入下一个字段名称。',[[('取消','admin')]])
         elif action=='pending':
-            self.pending_view(u,int(args[0]) if args else 0,message_id=message_id if args else None)
+            self.pending_view(u,int(args[0]) if args else 0,message_id=message_id if args else None,
+                              queue=args[1] if len(args)>1 else 'ready')
         elif action=='batch':
-            self.batch_view(u,args[0],int(args[1]) if len(args)>1 else 0,message_id=message_id if len(args)>1 else None)
+            self.batch_view(u,args[0],int(args[1]) if len(args)>1 else 0,
+                            message_id=message_id if len(args)>1 else None,queue=args[2] if len(args)>2 else None,
+                            list_page=int(args[3]) if len(args)>3 else 0)
+        elif action=='verify':
+            self.verify_order(u,args[0])
+        elif action=='vpart':
+            oid,kind,ident=args
+            self.verify_part(u,oid,kind,int(ident),show=True)
+            self.send(u,'核实这段在客户聊天中的送达结果，再选择处理方式。',[
+                [('已送达',f'vstart:{oid}:{kind}:{ident}:sent'),('确认未送达',f'vstart:{oid}:{kind}:{ident}:retry')],
+                [('返回核实','verify:'+oid)],
+            ])
+        elif action=='vstart':
+            oid,kind,ident,choice=args
+            if choice not in ('sent','retry') or (kind=='resume' and choice!='retry'):
+                raise DomainError('核实操作无效。')
+            self.verify_part(u,oid,kind,int(ident))
+            self.s.set_session(u,{'mode':'verify_input','order':oid,'kind':kind,'part':int(ident),'choice':choice})
+            prompt=('请输入「Telegram消息编号 核实依据」，例如「123 已向客户核对」。'
+                    if choice=='sent' else '请输入确认未送达的依据。下一步确认后才会重发。')
+            self.send(u,prompt,[[('取消','verify:'+oid)]])
+        elif action=='vconfirm':
+            if state.get('mode')!='verify_confirm' or not args or args[0]!=state.get('key'):
+                raise DomainError('核实确认已失效。')
+            oid,kind,ident=state['order'],state['kind'],state['part']
+            self.verify_part(u,oid,kind,ident)
+            if kind=='part':
+                self.s.resolve(u,ident,state['choice']=='sent',state['message_id'],state['evidence'])
+            elif kind=='bulk':
+                self.s.resolve_event(u,ident,state['choice'],state['message_id'],state['evidence'])
+            else:
+                self.s.resume(u,oid,state['evidence'])
+            self.s.set_session(u,{})
+            self.send(u,'核实结果已记录。',[[('查看订单','order:'+oid),('待核实列表','pending:0:verify')]])
         elif action=='bulk':
             batch=args[0]
             orders=self.s.bulk_rows(u,batch)
@@ -464,7 +501,9 @@ class App(PaymentUI,AdminUI):
             o=self.s.order(args[0]); p=json.loads(o['snapshot'])
             tiers=product_tiers(p)
             quote=self.s.open_quote(o['id'])
-            status='等待客户确认补差价' if quote else ORDER_STATES[o['status']]
+            needs_verification=(o['status']=='uncertain' or
+                                (o['status']=='bulk_delivering' and bool(self.s.uncertain_bulk_events(o['id']))))
+            status='等待客户确认补差价' if quote else ('待核实' if needs_verification else ORDER_STATES[o['status']])
             details=[f"{p['name']} · {status} · {o['price']} 积分"]
             tier=next((name for name,price in tiers.items() if price==o['price']),None)
             if tier: details.append(f'当前档位：{tier}')
@@ -486,8 +525,12 @@ class App(PaymentUI,AdminUI):
                 rows.append([('空单退分','refund:'+o['id']+':empty'),('管理员取消','refund:'+o['id']+':cancel')])
             elif o['status']=='uncertain':
                 rows.append([('管理员取消','refund:'+o['id']+':cancel')])
+            if needs_verification:
+                rows.append([('核实送达','verify:'+o['id'])])
             if o['status']=='pending' and any(price>o['price'] for price in tiers.values()):
                 rows.append([('重新报价' if quote else '发起补差价','quote:'+o['id'])])
+            queue='quote' if quote else ('verify' if needs_verification else 'ready')
+            rows.append([('返回订单管理','pending:0:'+queue)])
             result=self.send(u,'\n'.join(details),rows)
             if o['status']=='pending' and not quote: self.s.link_reply(result['message_id'],o['id'])
             for item in attachments: self.send_payload(u,item)
@@ -523,7 +566,7 @@ class App(PaymentUI,AdminUI):
                     else:
                         self.send(u,f"待核实通知事件 {e['id']} / {e['kind']}")
         elif action=='topup':
-            self.topup_view(u)
+            self.topup_view(u,args[0] if args else None)
         elif action=='checkpay':
             self.payment_check(u,args[0],message_id=message_id)
         else: raise DomainError('按钮已失效，请发送 /start')
@@ -624,6 +667,7 @@ class App(PaymentUI,AdminUI):
         details=[f"🛍 {p['name']}"]
         rows=[]
         price=p['price']
+        tier=None
         if r['tier_price'] is not None:
             if p['revision']!=r['revision'] or not p['active']:
                 raise DomainError('档位已更新，请重新打开商品选择。')
@@ -644,15 +688,29 @@ class App(PaymentUI,AdminUI):
                 details.append(f'已收到 {len(current)} 份，可继续上传。')
                 if missing: rows.append([('下一项',f'draftnext:{d}:{r["edit_version"]}')])
         if not missing and not prompt_only and not show_product:
+            details=[f"确认报单 · {p['name']}"]
+            try:
+                submissions=self.s.submissions(r,p)
+                count=len(submissions)
+                total=count*price
+                details.append(f"{'档位：'+tier+' · ' if tier else ''}{count} 单 × {price} 积分\n需冻结 {total} 积分")
+                shortage=total-self.s.balance(u)[0]
+                if shortage>0:
+                    details.append(f'余额不足，还差 {shortage} 积分。充值后回来确认。')
+                    rows.append([('去充值','topup:'+d)])
+                else:
+                    rows.append([('确认提交',f'confirm:{d}:{r["edit_version"]}')])
+            except DomainError as error:
+                details.append(str(error))
+                submissions=[]
+            rows.append([('修改资料','field:'+d+':0')])
+            details.append('提交资料')
             for i,f in enumerate(p['fields']):
                 items=r['data'].get(str(i),[])
-                if f['kind']=='text': details.extend(f"{f['name']}：{item['text']}" for item in items)
+                if batch_text and len(submissions)>1:
+                    details.append('\n'.join(f'{j}. {item["0"][0]["text"]}' for j,item in enumerate(submissions,1)))
+                elif f['kind']=='text': details.extend(f"{f['name']}：{item['text']}" for item in items)
                 else: details.append(f"{f['name']}：已收到 {len(items)} 份{FIELD_TYPES[f['kind']]}")
-            try:
-                count=len(self.s.submissions(r,p))
-                details.append(f'共 {count} 单，需 {count*price} 积分。')
-                rows.insert(0,[('确认提交',f'confirm:{d}:{r["edit_version"]}'),('修改','field:'+d+':0')])
-            except DomainError as error: details.append(str(error))
         if len(p['fields'])>1:
             fields=[(('已填 · ' if r['data'].get(str(i)) else '待填 · ')+f['name'],'field:'+d+':'+str(i)) for i,f in enumerate(p['fields'])]
             rows.extend([fields[i:i+2] for i in range(0,len(fields),2)])
@@ -718,16 +776,23 @@ class App(PaymentUI,AdminUI):
             message_id=int(mid)
             if choice=='sent' and message_id<1: raise DomainError('请提供已发送消息ID')
             if choice!='sent' and message_id!=0: raise DomainError('请将未送达的消息ID填为 0')
-            with self.s.tx() as c:
-                e=c.execute("SELECT * FROM events WHERE id=? AND state='uncertain'",(int(eid),)).fetchone()
-                if not e: raise DomainError('事件不在待核实状态')
-                if choice=='cancel' and e['kind']!='bulk_receipt': raise DomainError('仅批量回单可用 cancel')
-                if e['kind']=='bulk_receipt' and choice in ('sent','cancel'):
-                    self.s.finish_bulk(c,e,message_id,cancel=choice=='cancel')
-                event_state={'sent':'sent','retry':'pending','cancel':'cancelled'}[choice]
-                c.execute('UPDATE events SET state=?,message_id=?,retry_at=NULL WHERE id=?',(event_state,message_id,int(eid)))
-                self.s.audit(c,u,'event_resolve',eid,choice+':'+mid)
+            self.s.resolve_event(u,int(eid),choice,message_id)
             self.send(u,'通知核实结果已记录。'); return
+        if state.get('mode') in ('verify_input','verify_confirm'):
+            self.s.admin(u)
+            evidence=text.strip()
+            mid=0
+            if state['choice']=='sent':
+                mid_text,_,evidence=evidence.partition(' ')
+                if not mid_text.isascii() or not mid_text.isdigit() or len(mid_text)>18 or int(mid_text)<1:
+                    raise DomainError('请填写有效的消息编号和核实依据。')
+                mid=int(mid_text)
+            if not evidence.strip(): raise DomainError('请填写核实依据。')
+            state.update(mode='verify_confirm',message_id=mid,evidence=evidence.strip(),key=uid())
+            self.s.set_session(u,state)
+            label='确认标记已送达' if mid else '确认重发未送达部分'
+            self.send(u,label+'？',[[('确认','vconfirm:'+state['key']),('取消','verify:'+state['order'])]])
+            return
         if state.get('mode') in ('bulk','bulk_preview'):
             self.s.admin(u)
             batch=state['batch']
@@ -875,7 +940,7 @@ class App(PaymentUI,AdminUI):
                     if r['state']!='staged': raise DomainError('投递状态不确定')
                     self.s.mark_sending(r['id'])
                     try:
-                        result=self.send_payload(o['user_id'],json.loads(r['payload']))
+                        result=self.send_payload(o['user_id'],json.loads(r['delivery_payload'] or r['payload']))
                     except TelegramRejected as error:
                         self.s.reject_receipt(o['id'],r['id'],error.retry_after)
                         break

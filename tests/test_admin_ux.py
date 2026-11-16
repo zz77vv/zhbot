@@ -182,3 +182,43 @@ class AdminUXTests(Fixture, unittest.TestCase):
         before = len(self.t.calls)
         self.app.deliver()
         self.assertEqual(before, len(self.t.calls))
+
+    def test_uncertain_queue_resolution_requires_confirmation_and_sends_only_unsent(self):
+        order=self.order()
+        oid=order['id']
+        self.s.add_receipt(99,oid,{'kind':'text','text':'结果'})
+        self.click(self.preview(order))
+        self.t.fail=True
+        self.app.deliver()
+        self.t.fail=False
+        self.click('pending:0:verify')
+        self.assertIn('1 单 · 1 批',self.t.calls[-1][1]['text'])
+        self.click('order:'+oid)
+        self.assertIn('verify:'+oid,[button['callback_data'] for button in self.buttons()])
+        self.click('verify:'+oid)
+        part=self.s.receipts(oid,include_context=True)[0]
+        self.click(f"vstart:{oid}:part:{part['id']}:sent")
+        self.app.message(99,{'text':'123 已向客户核对'})
+        confirm=next(b['callback_data'] for b in self.buttons() if b['callback_data'].startswith('vconfirm:'))
+        self.assertEqual((7,3),self.s.balance(1))
+        self.click(confirm,user=1)
+        self.assertEqual('uncertain',self.s.order(oid)['status'])
+        before=len(self.t.calls)
+        self.click(confirm)
+        self.app.deliver()
+        self.assertEqual('completed',self.s.order(oid)['status'])
+        self.assertEqual((7,0),self.s.balance(1))
+        self.assertFalse(any(data.get('chat_id')==1 for _,data in self.t.calls[before:]))
+
+    def test_quote_queue_does_not_count_waiting_orders_as_ready(self):
+        self.s.set_product_tiers(99,self.p,self.s.product(self.p)['revision'],{'低':1,'高':2})
+        order=self.order()
+        self.s.offer_quote(99,order['id'],'高')
+        self.click('pending')
+        self.assertIn('0 单 · 0 批',self.t.calls[-1][1]['text'])
+        self.click('pending:0:quote')
+        self.assertIn('1 单 · 1 批',self.t.calls[-1][1]['text'])
+        batch=next(b['callback_data'] for b in self.buttons() if b['callback_data'].startswith('batch:'))
+        self.click(batch)
+        self.assertIn('等补差价 · 1 单',self.t.calls[-1][1]['text'])
+        self.assertIn('pending:0:quote',[b['callback_data'] for b in self.buttons()])

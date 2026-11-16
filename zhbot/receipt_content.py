@@ -34,6 +34,15 @@ def text_parts(text):
         yield {'kind': 'text', 'text': text[start:start + 2000]}
 
 
+def combined_receipt(context, results):
+    if len(results)!=1 or results[0]['kind']!='text' or any(item['kind']!='text' for item in context):
+        return None
+    text=''.join(item['text'] for item in context)+'\n'+results[0]['text']
+    if len(text.encode('utf-16-le'))//2<=2000:
+        return {'kind':'text','text':text}
+    return None
+
+
 def bulk_sections(orders, results):
     """Group complete original/result pairs within the existing message budget."""
     groups = []
