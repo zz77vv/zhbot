@@ -55,6 +55,17 @@ class CustomerUXTests(Fixture,unittest.TestCase):
     def confirm_button(self):
         return next(button for button in self.buttons() if button.startswith('confirm:'))
 
+    def test_tier_picker_returns_to_original_region_page(self):
+        for number in range(9):
+            pid=self.s.save_product(99,dict(self.s.product(self.p),id=None,name=f'地区{number}',placement='region'))
+        self.s.set_product_tiers(99,pid,self.s.product(pid)['revision'],{'普通':2,'进阶':5})
+        self.click('region:1')
+        self.click(next(button for button in self.buttons() if button.startswith('buy:')))
+        self.assertIn('region:1',self.buttons())
+        self.click('region:1')
+        self.assertIn('第 2 / 2 页',self.card()['text'])
+        self.assertEqual([],self.s.rows('SELECT * FROM drafts'))
+
     def test_text_fields_advance_to_next_missing_field_and_reuse_card(self):
         pid=self.product([{'name':'账号','kind':'text'},{'name':'地区','kind':'text'},{'name':'说明','kind':'text'}])
         d=self.start(pid)
@@ -122,8 +133,16 @@ class CustomerUXTests(Fixture,unittest.TestCase):
     def test_insufficient_balance_preserves_data_and_requires_new_preview_confirmation(self):
         d=self.start()
         self.msg('a\nb\nc\nd')
+        self.assertIn('topup:'+d,self.buttons())
+        self.assertFalse(any(button.startswith('confirm:') for button in self.buttons()))
+        self.app.payments=object()
+        self.click('topup:'+d)
+        self.assertIn('resume:'+d,self.buttons())
+        self.s.adjust(99,1,2,'补款','initial-credit')
+        self.click('resume:'+d)
         old_confirm=self.confirm_button()
         data=self.s.draft(1,d)['data']
+        self.s.adjust(99,1,-2,'余额变动','credit-reversal')
         self.click(old_confirm)
         self.assertEqual((10,0),self.s.balance(1))
         self.assertEqual([],self.s.orders())
@@ -139,7 +158,7 @@ class CustomerUXTests(Fixture,unittest.TestCase):
         self.click('resume:'+d)
         new_confirm=self.confirm_button()
         self.assertNotEqual(old_confirm,new_confirm)
-        self.assertIn('a\nb\nc\nd',self.card()['text'])
+        self.assertIn('1. a\n2. b\n3. c\n4. d',self.card()['text'])
         self.assertEqual([],self.s.orders())
         self.click(old_confirm)
         self.assertEqual([],self.s.orders())

@@ -87,8 +87,9 @@ class RetentionTests(Fixture, unittest.TestCase):
         d, b, o = self.terminal_order()
         before = {t: self.s.rows('SELECT * FROM '+t) for t in ('wallets','ledger','audit','payments','payment_checks')}
         with self.s.tx() as c:
-            c.execute("INSERT INTO receipts(order_id,payload,state,message_id) VALUES(?,?,'sent',123)",
-                      (o, json.dumps({'kind': 'text', 'text': 'private-result'})))
+            c.execute("INSERT INTO receipts(order_id,payload,state,message_id,delivery_payload) VALUES(?,?,'sent',123,?)",
+                      (o, json.dumps({'kind': 'text', 'text': 'private-result'}),
+                       json.dumps({'kind': 'text', 'text': 'private-original-and-result'})))
             c.execute('INSERT INTO reply_links VALUES(12,?)', (o,))
         self.due(); result = self.run_cleanup()
         order = self.s.order(o)
@@ -96,6 +97,7 @@ class RetentionTests(Fixture, unittest.TestCase):
         self.assertTrue(order['data_cleared_at'])
         self.assertEqual('test refund', order['reason'])
         self.assertNotIn('private-result', self.s.receipts(o)[0]['payload'])
+        self.assertIsNone(self.s.receipts(o)[0]['delivery_payload'])
         self.assertEqual('sent', self.s.receipts(o)[0]['state'])
         self.assertEqual(123, self.s.receipts(o)[0]['message_id'])
         self.assertEqual([], self.s.rows('SELECT * FROM reply_links'))
@@ -231,4 +233,4 @@ class RetentionTests(Fixture, unittest.TestCase):
         self.assertGreater(upgraded.one('SELECT updated_at FROM sessions')['updated_at'],self.age(1))
         self.assertGreater(upgraded.events()[0]['finished_at'],self.age(1))
         self.assertEqual('home',upgraded.product(1)['placement'])
-        self.assertEqual(14,Store(path,99).one('SELECT MAX(version) AS n FROM schema_migrations')['n'])
+        self.assertEqual(15,Store(path,99).one('SELECT MAX(version) AS n FROM schema_migrations')['n'])

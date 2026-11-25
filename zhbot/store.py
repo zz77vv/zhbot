@@ -6,7 +6,7 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from .receipt_content import bulk_sections, original_submission
+from .receipt_content import bulk_sections, combined_receipt, original_submission
 
 LEGACY_TIERS = {
     'owner': {'新菜': 1, '大众名': 2, '剩菜': 12},
@@ -381,8 +381,14 @@ class Store:
             if any(r['state']!='staged' for r in receipts):
                 raise DomainError('回单状态已改变，请核实后再处理。')
             if include_submission:
-                c.executemany('INSERT INTO receipts(order_id,payload,context) VALUES(?,?,1)',
-                              ((o,dump(item)) for item in original_submission(order)))
+                context=list(original_submission(order))
+                combined=combined_receipt(context,[json.loads(item['payload']) for item in receipts])
+                if combined:
+                    c.execute('UPDATE receipts SET delivery_payload=? WHERE id=?',
+                              (dump(combined),receipts[0]['id']))
+                else:
+                    c.executemany('INSERT INTO receipts(order_id,payload,context) VALUES(?,?,1)',
+                                  ((o,dump(item)) for item in context))
             c.execute("UPDATE orders SET status='delivering' WHERE id=?",(o,)); self.audit(c,actor,'deliver',o)
     def mark_sending(self,rid):
         with self.tx() as c:
@@ -454,6 +460,23 @@ class Store:
     def event(self,c,key,kind,target,payload):
         c.execute('INSERT OR IGNORE INTO events(event_key,kind,target,payload) VALUES(?,?,?,?)',(key,kind,target,dump(payload)))
     def events(self): return self.rows('SELECT * FROM events ORDER BY id')
+    def uncertain_bulk_events(self,order_id):
+        return self.rows(
+            "SELECT e.* FROM events e WHERE e.kind='bulk_receipt' AND e.state='uncertain' "
+            "AND EXISTS(SELECT 1 FROM json_each(e.payload,'$.items') WHERE key=?) ORDER BY e.id",(order_id,))
+    def resolve_event(self,actor,event_id,choice,message_id,evidence=''):
+        self.admin(actor)
+        if choice not in ('sent','retry','cancel') or (choice=='sent' and message_id<1) or (choice!='sent' and message_id!=0):
+            raise DomainError('已送达须填写消息ID，未送达请填 0。')
+        with self.tx() as c:
+            event=c.execute("SELECT * FROM events WHERE id=? AND state='uncertain'",(event_id,)).fetchone()
+            if not event: raise DomainError('事件不在待核实状态')
+            if choice=='cancel' and event['kind']!='bulk_receipt': raise DomainError('仅批量回单可取消')
+            if event['kind']=='bulk_receipt' and choice in ('sent','cancel'):
+                self.finish_bulk(c,event,message_id,cancel=choice=='cancel')
+            state={'sent':'sent','retry':'pending','cancel':'cancelled'}[choice]
+            c.execute('UPDATE events SET state=?,message_id=?,retry_at=NULL WHERE id=?',(state,message_id,event_id))
+            self.audit(c,actor,'event_resolve',event_id,f'{choice}:{message_id} {evidence}'.strip())
     def recover(self):
         with self.tx() as c:
             c.execute("UPDATE orders SET status='uncertain' WHERE status='delivering' AND id IN (SELECT order_id FROM receipts WHERE state='sending')")

@@ -130,7 +130,7 @@ class Retention:
                     OR o.batch_id IN {references('s.data')})
                 ORDER BY o.id LIMIT ?""", (long, long, limit)).fetchall()
             for row in rows:
-                c.execute("UPDATE receipts SET payload=? WHERE order_id=?",
+                c.execute("UPDATE receipts SET payload=?,delivery_payload=NULL WHERE order_id=?",
                     (json.dumps({'kind': 'text', 'text': '回单内容已按保留规则清理'}, ensure_ascii=False), row[0]))
                 c.execute('DELETE FROM reply_links WHERE order_id=?', (row[0],))
                 c.execute("UPDATE orders SET submission='{}',data_cleared_at=? WHERE id=?", (stamp(started), row[0]))
